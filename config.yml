@@ -81,6 +81,27 @@ Files:
 # High-level switches for enabling/disabling major features and models.
 #--------------------------------------------------------------------------------------
 Features:
+  # --- Detector Selection ---
+  # Options: "mediapipe" (Default) or "deeplabcut"
+  DETECTOR_TYPE: "deeplabcut"
+
+  # Path to the exported DeepLabCut model directory (required if DETECTOR_TYPE is "deeplabcut").
+  # This folder must contain the exported .pb file and pose_cfg.yaml.
+  # Example: Point to the FOLDER, not the file.
+  DLC_MODEL_PATH: r"G:\Meine Ablage\PhD\data\OCAPI\ocapi-Max-2026-02-13\exported-models\DLC_ocapi_resnet_50_iteration-0_shuffle-1"
+
+  # --- DeepLabCut Label Mapping ---
+  # Map Ocapi's required semantic features (keys) to YOUR DeepLabCut model's labels (values).
+  DLC_LABEL_MAPPING:
+    left_iris_center: "pupil_left"
+    right_iris_center: "pupil_right"
+    left_eye_outer_corner: "eye_corner_left"
+    right_eye_outer_corner: "eye_corner_right"
+    nose_tip: "nose"
+    chin: "chin"
+    left_mouth_corner: "mouth_left"
+    right_mouth_corner: "mouth_right"
+
   # --- MediaPipe Model Settings ---
   # Maximum number of faces to detect in a frame.
   MAX_NUM_FACES: 1
