@@ -11,15 +11,190 @@ import cv2 as cv
 import re
 import mediapipe as mp
 import yaml
+from dataclasses import dataclass
+from typing import Optional, Any
 from sklearn.cluster import DBSCAN # Add this import at the top of the file
 
 
 # some good aesthetics
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
-mp_face_mesh = mp.solutions.face_mesh
-drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=0)
+try:
+    mp_drawing = mp.solutions.drawing_utils
+    mp_drawing_styles = mp.solutions.drawing_styles
+    mp_face_mesh = mp.solutions.face_mesh
+    drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=0)
+except AttributeError:
+    # MediaPipe solutions not available (likely due to protobuf conflict with DLCLive)
+    mp_drawing = None
+    mp_drawing_styles = None
+    mp_face_mesh = None
+    drawing_spec = None
 
+
+@dataclass
+class FaceLandmarks:
+    """Standardized container for semantic face landmarks, agnostic of the detector backend."""
+    left_iris_center: Optional[np.ndarray] = None
+    right_iris_center: Optional[np.ndarray] = None
+    left_eye_outer_corner: Optional[np.ndarray] = None
+    right_eye_outer_corner: Optional[np.ndarray] = None
+    
+    # Points required for Head Pose Estimation (PnP)
+    nose_tip: Optional[np.ndarray] = None
+    chin: Optional[np.ndarray] = None
+    left_mouth_corner: Optional[np.ndarray] = None
+    right_mouth_corner: Optional[np.ndarray] = None
+    
+    # Raw data for logging or specific calculations (Backend specific)
+    raw_mesh_points_2d: Optional[np.ndarray] = None
+    raw_mesh_points_3d: Optional[np.ndarray] = None
+    mp_multi_face_landmarks: Any = None # Keep original MP object for drawing utils
+
+
+class MediaPipeDetector:
+    """Encapsulates MediaPipe specific logic and indices."""
+    def __init__(self, config):
+        self.config = config
+        if mp_face_mesh is None:
+            raise ImportError("MediaPipe solutions module is not available. Check for protobuf version conflicts.")
+        self.face_mesh = mp_face_mesh.FaceMesh(
+            max_num_faces=config.MAX_NUM_FACES, 
+            refine_landmarks=config.USE_ATTENTION_MESH,
+            min_detection_confidence=config.MIN_DETECTION_CONFIDENCE,
+            min_tracking_confidence=config.MIN_TRACKING_CONFIDENCE
+        )
+
+    def detect(self, frame) -> Optional[FaceLandmarks]:
+        rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb_frame)
+        
+        if not results.multi_face_landmarks:
+            return None
+            
+        face_landmarks_mp = results.multi_face_landmarks[0]
+        img_h, img_w = frame.shape[:2]
+        
+        # Convert to numpy array
+        mesh_points = np.array([np.multiply([p.x, p.y], [img_w, img_h]).astype(int) for p in face_landmarks_mp.landmark])
+        mesh_points_3d = np.array([[n.x, n.y, n.z] for n in face_landmarks_mp.landmark])
+
+        # Extract semantic points using config indices
+        # 1. Iris Centers (calculated via MinEnclosingCircle for MP)
+        (l_cx, l_cy), _ = cv.minEnclosingCircle(mesh_points[self.config.LEFT_EYE_IRIS])
+        (r_cx, r_cy), _ = cv.minEnclosingCircle(mesh_points[self.config.RIGHT_EYE_IRIS])
+        
+        return FaceLandmarks(
+            left_iris_center=np.array([l_cx, l_cy]),
+            right_iris_center=np.array([r_cx, r_cy]),
+            left_eye_outer_corner=mesh_points[self.config.LEFT_EYE_OUTER_CORNER].astype(np.float32),
+            right_eye_outer_corner=mesh_points[self.config.RIGHT_EYE_OUTER_CORNER].astype(np.float32),
+            
+            nose_tip=mesh_points[self.config.NOSE_TIP_INDEX].astype(np.float32),
+            chin=mesh_points[self.config.CHIN_INDEX].astype(np.float32),
+            left_mouth_corner=mesh_points[self.config.LEFT_MOUTH_CORNER].astype(np.float32),
+            right_mouth_corner=mesh_points[self.config.RIGHT_MOUTH_CORNER].astype(np.float32),
+            
+            raw_mesh_points_2d=mesh_points,
+            raw_mesh_points_3d=mesh_points_3d,
+            mp_multi_face_landmarks=results # Store full results for drawing
+        )
+
+
+class DeepLabCutDetector:
+    """
+    Detector using a custom trained DeepLabCut model.
+    Requires 'dlclive' to be installed and 'DLC_MODEL_PATH' in config.
+    """
+    def __init__(self, config):
+        try:
+            import dlclive
+            from dlclive import DLCLive, Processor
+        except ImportError:
+            raise ImportError("DeepLabCut Live is not installed. Please run: pip install dlclive")
+
+        self.config = config
+        model_path = getattr(config, "DLC_MODEL_PATH", None)
+        if not model_path:
+            raise ValueError("DLC_MODEL_PATH not set in config.yaml")
+
+        # Sanitize model_path in case user copied python raw string syntax (r"...") into YAML
+        if isinstance(model_path, str):
+            model_path = model_path.strip()
+            # Remove r"..." or r'...' wrappers
+            if (model_path.startswith('r"') and model_path.endswith('"')) or \
+               (model_path.startswith("r'") and model_path.endswith("'")):
+                model_path = model_path[2:-1]
+            # Remove "..." or '...' wrappers if present without r
+            elif (model_path.startswith('"') and model_path.endswith('"')) or \
+                 (model_path.startswith("'") and model_path.endswith("'")):
+                model_path = model_path[1:-1]
+
+        # Load the label mapping from config.yml
+        self.mapping = getattr(config, "DLC_LABEL_MAPPING", {})
+
+        try:
+            if getattr(config, "PRINT_DATA", True):
+                print(f"DEBUG: Initializing DLCLive with model path: '{model_path}'")
+
+            # The simple, robust way that matches the working demo script.
+            # DLCLive is smart enough to determine the model type from the directory contents.
+            # Forcing a model_type can cause issues if the path is a directory.
+            self.dlc_proc = DLCLive(model_path)
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize DLCLive with path: {model_path}\nError: {e}")
+
+        # Extract body part names from the loaded configuration within DLCLive
+        # Newer DLCLive versions loading .pt files store config internally
+        if hasattr(self.dlc_proc, 'pose_cfg') and self.dlc_proc.pose_cfg:
+            self.body_parts = self.dlc_proc.pose_cfg.get('all_joints_names', [])
+        else:
+            # Fallback: try to find pose_cfg.yaml manually if DLCLive didn't expose it
+            search_dir = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
+            pose_cfg_path = os.path.join(search_dir, "pose_cfg.yaml")
+            if os.path.exists(pose_cfg_path):
+                with open(pose_cfg_path, 'r') as f:
+                    self.body_parts = yaml.safe_load(f).get('all_joints_names', [])
+            else:
+                raise ValueError(f"Could not determine body parts. DLCLive object has no 'pose_cfg' and 'pose_cfg.yaml' not found in {search_dir}")
+
+        # Initialize inference (warmup) with a dummy image
+        # DLC expects height, width, channels
+        self.dlc_proc.init_inference(np.zeros((int(config.cap.get(cv.CAP_PROP_FRAME_HEIGHT)),
+                                               int(config.cap.get(cv.CAP_PROP_FRAME_WIDTH)), 3), dtype=np.uint8))
+
+    def detect(self, frame) -> Optional[FaceLandmarks]:
+        # DLC Live returns a pose object. The structure depends on your export settings.
+        # Usually it is a numpy array of shape (N, 3) -> [x, y, likelihood]
+        pose = self.dlc_proc.get_pose(frame)
+
+        landmarks_data = {}
+        required_keys = [
+            'left_iris_center', 'right_iris_center',
+            'left_eye_outer_corner', 'right_eye_outer_corner',
+            'nose_tip', 'chin',
+            'left_mouth_corner', 'right_mouth_corner'
+        ]
+
+        for key in required_keys:
+            dlc_label = self.mapping.get(key)
+
+            # If label is not mapped or not found in model, we cannot form a complete face
+            if not dlc_label or dlc_label not in self.body_parts:
+                # You might want to log a warning here once
+                return None
+
+            idx = self.body_parts.index(dlc_label)
+
+            # Check confidence
+            confidence = pose[idx][2]
+            if confidence >= self.config.MIN_DETECTION_CONFIDENCE:
+                landmarks_data[key] = pose[idx][:2] # Store [x, y]
+
+        # If we have no data at all, return None
+        if not landmarks_data:
+            return None
+            
+        return FaceLandmarks(**landmarks_data)
 
 class Ocapi(object):
 	def __init__(self, subject_id=None, config_file_path="config.yaml", VIDEO_INPUT=None, VIDEO_OUTPUT=None, WEBCAM=0,
@@ -35,11 +210,11 @@ class Ocapi(object):
 		self.WEBCAM = WEBCAM
 		self.total_frames = total_frames or 0
 
-		# 1. Load all parameters from the YAML file into class attributes
-		self.load_config(file_path=config_file_path)
-
 		# Setup logging before any print statements
 		self._setup_logging()
+
+		# 1. Load all parameters from the YAML file into class attributes
+		self.load_config(file_path=config_file_path)
 
 		# 3. Set default values for any attributes that might be missing from the config
 		# This makes the class more robust.
@@ -94,7 +269,12 @@ class Ocapi(object):
 		if self.FPS == 0:
 			self.logger.warning("Video FPS reported as 0. Defaulting to 30 FPS for calculations.")
 			self.FPS = 30.0
-		self.face_mesh = self.init_face_mesh()
+		
+		detector_type = getattr(self, "DETECTOR_TYPE", "mediapipe")
+		if detector_type.lower() == "deeplabcut":
+			self.detector = DeepLabCutDetector(self)
+		else:
+			self.detector = MediaPipeDetector(self)
 		self.socket = self.init_socket()
 
 		# 5. Initialize state variables
@@ -474,18 +654,18 @@ class Ocapi(object):
 		denominator = 3 * np.linalg.norm(P0 - P8) ** 3
 		return numerator / denominator if denominator else 0
 
-	def estimate_head_pose(self, landmarks, image_size):
+	def estimate_head_pose(self, landmarks: FaceLandmarks, image_size):
 		scale_factor = self.USER_FACE_WIDTH / 150.0
 		# This 3D model is a generic representation of a human head.
-		# The points correspond to the landmark indices defined in `_indices_pose`.
-		model_points = np.array([
-			(0.0, 0.0, 0.0),                                                      # Nose tip (4)
-			(0.0, -330.0 * scale_factor, -65.0 * scale_factor),                  # Chin (152)
-			(-225.0 * scale_factor, 170.0 * scale_factor, -135.0 * scale_factor), # Left eye outer corner (263)
-			(225.0 * scale_factor, 170.0 * scale_factor, -135.0 * scale_factor),  # Right eye outer corner (33)
-			(-150.0 * scale_factor, -150.0 * scale_factor, -125.0 * scale_factor),# Left Mouth corner (291)
-			(150.0 * scale_factor, -150.0 * scale_factor, -125.0 * scale_factor)  # Right mouth corner (61)
-		])
+		# Map attribute names to 3D model points
+		model_points_map = {
+			'nose_tip': (0.0, 0.0, 0.0),
+			'chin': (0.0, -330.0 * scale_factor, -65.0 * scale_factor),
+			'left_eye_outer_corner': (-225.0 * scale_factor, 170.0 * scale_factor, -135.0 * scale_factor),
+			'right_eye_outer_corner': (225.0 * scale_factor, 170.0 * scale_factor, -135.0 * scale_factor),
+			'left_mouth_corner': (-150.0 * scale_factor, -150.0 * scale_factor, -125.0 * scale_factor),
+			'right_mouth_corner': (150.0 * scale_factor, -150.0 * scale_factor, -125.0 * scale_factor)
+		}
 
 		focal_length = image_size[1]
 		center = (image_size[1] / 2, image_size[0] / 2)
@@ -493,12 +673,22 @@ class Ocapi(object):
 		                         dtype="double")
 		dist_coeffs = np.zeros((4, 1))
 
-		# Gather the 2D image points corresponding to the 3D model points.
-		# The order MUST match the order in `model_points`.
-		# The indices are loaded from the config file via `self._indices_pose`.
-		image_points = np.array([
-			landmarks[idx] for idx in self._indices_pose
-		], dtype="double")
+		# Dynamically build the 2D-3D correspondences based on available landmarks
+		image_points_list = []
+		model_points_list = []
+
+		for attr_name, point_3d in model_points_map.items():
+			point_2d = getattr(landmarks, attr_name)
+			if point_2d is not None:
+				image_points_list.append(point_2d)
+				model_points_list.append(point_3d)
+
+		# We need at least 4 points for a reliable PnP solution
+		if len(image_points_list) < 4:
+			return 0.0, 0.0, 0.0
+
+		image_points = np.array(image_points_list, dtype="double")
+		model_points = np.array(model_points_list, dtype="double")
 
 		try:
 			(success, rotation_vector, translation_vector) = cv.solvePnP(model_points, image_points, camera_matrix,
@@ -525,15 +715,6 @@ class Ocapi(object):
 		right_eye_ratio = self.euclidean_distance_3D(landmarks[self.RIGHT_EYE_POINTS])
 		left_eye_ratio = self.euclidean_distance_3D(landmarks[self.LEFT_EYE_POINTS])
 		return (right_eye_ratio + left_eye_ratio + 1) / 2
-
-	def init_face_mesh(self):
-		if self.PRINT_DATA:
-			self.logger.info("Initializing the face mesh and camera...")
-			self.logger.info(f"Head pose estimation is {'enabled' if self.ENABLE_HEAD_POSE else 'disabled'}.")
-		return mp.solutions.face_mesh.FaceMesh(
-			max_num_faces=self.MAX_NUM_FACES, refine_landmarks=self.USE_ATTENTION_MESH,
-			min_detection_confidence=self.MIN_DETECTION_CONFIDENCE,
-			min_tracking_confidence=self.MIN_TRACKING_CONFIDENCE)
 
 	def init_video_input(self):
 		if self.WEBCAM is None and self.VIDEO_INPUT:
@@ -785,32 +966,20 @@ class Ocapi(object):
 		img_h, img_w = frame.shape[:2]
 		return frame, img_h, img_w, True
 
-	def _process_face_mesh(self, frame):
-		rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-		results = self.face_mesh.process(rgb_frame)
-		mesh_points = None
-		mesh_points_3D_normalized = None
-		face_landmarks_mp = None
-		if results.multi_face_landmarks:
-			face_landmarks_mp = results.multi_face_landmarks[0]
-			img_h, img_w = frame.shape[:2]
-			mesh_points = np.array(
-				[np.multiply([p.x, p.y], [img_w, img_h]).astype(int)
-				 for p in face_landmarks_mp.landmark])
-			mesh_points_3D_normalized = np.array(
-				[[n.x, n.y, n.z] for n in face_landmarks_mp.landmark])
-		return results, face_landmarks_mp, mesh_points, mesh_points_3D_normalized
-
-	def _extract_eye_features(self, mesh_points):
+	def _extract_eye_features(self, landmarks: FaceLandmarks):
 		try:
-			(l_cx_f, l_cy_f), _ = cv.minEnclosingCircle(mesh_points[self.LEFT_EYE_IRIS])
-			(r_cx_f, r_cy_f), _ = cv.minEnclosingCircle(mesh_points[self.RIGHT_EYE_IRIS])
+			# Use pre-calculated centers from the detector
+			l_cx_f, l_cy_f = landmarks.left_iris_center
+			r_cx_f, r_cy_f = landmarks.right_iris_center
+			
 			self.l_cx, self.l_cy = int(l_cx_f), int(l_cy_f)
 			self.r_cx, self.r_cy = int(r_cx_f), int(r_cy_f)
 			center_left = np.array([l_cx_f, l_cy_f], dtype=np.float32)
 			center_right = np.array([r_cx_f, r_cy_f], dtype=np.float32)
-			outer_left_corner = mesh_points[self.LEFT_EYE_OUTER_CORNER].astype(np.float32)
-			outer_right_corner = mesh_points[self.RIGHT_EYE_OUTER_CORNER].astype(np.float32)
+			
+			outer_left_corner = landmarks.left_eye_outer_corner
+			outer_right_corner = landmarks.right_eye_outer_corner
+			
 			self.l_dx, self.l_dy = self.vector_position(outer_left_corner, center_left)
 			self.r_dx, self.r_dy = self.vector_position(outer_right_corner, center_right)
 		except Exception:
@@ -837,9 +1006,9 @@ class Ocapi(object):
 				self.TOTAL_BLINKS += 1
 			self.EYES_BLINK_FRAME_COUNTER = 0
 
-	def _process_head_pose(self, mesh_points, img_h, img_w, key_pressed):
+	def _process_head_pose(self, landmarks: FaceLandmarks, img_h, img_w, key_pressed):
 		# Estimate raw head pose and apply moving average for smoothing
-		self.raw_head_pitch, self.raw_head_yaw, self.raw_head_roll = self.estimate_head_pose(mesh_points,
+		self.raw_head_pitch, self.raw_head_yaw, self.raw_head_roll = self.estimate_head_pose(landmarks,
 		                                                                                     (img_h, img_w))
 		self.angle_buffer.add([self.raw_head_pitch, self.raw_head_yaw, self.raw_head_roll])
 		self.smooth_pitch, self.smooth_yaw, self.smooth_roll = self.angle_buffer.get_average()
@@ -1348,7 +1517,7 @@ class Ocapi(object):
 		else:
 			self.gaze_on_stimulus_display_text = "GAZE OFF STIMULUS"
 
-	def _log_frame_data(self, current_frame_time_ms, frame_count, results_face_mesh, img_w, img_h):
+	def _log_frame_data(self, current_frame_time_ms, frame_count, landmarks: Optional[FaceLandmarks], img_w, img_h):
 		current_log_timestamp = 0
 		if not self.starting_timestamp:  # This case might not be hit if starting_timestamp is always set in __init__
 			current_log_timestamp = int(time.time() * 1000)
@@ -1369,9 +1538,9 @@ class Ocapi(object):
 			log_entry.extend([self.adj_pitch, self.adj_yaw, self.adj_roll])
 
 		if self.LOG_ALL_FEATURES:
-			if results_face_mesh and results_face_mesh.multi_face_landmarks:
+			if landmarks and landmarks.mp_multi_face_landmarks and landmarks.mp_multi_face_landmarks.multi_face_landmarks:
 				lm_flat = []
-				for p in results_face_mesh.multi_face_landmarks[0].landmark:
+				for p in landmarks.mp_multi_face_landmarks.multi_face_landmarks[0].landmark:
 					lm_flat.extend([p.x * img_w, p.y * img_h])
 					if self.LOG_Z_COORD: lm_flat.append(p.z)
 				log_entry.extend(lm_flat)
@@ -1388,7 +1557,7 @@ class Ocapi(object):
 			self.socket.sendto(packet, self.SERVER_ADDRESS)
 			if self.PRINT_DATA: self.logger.info(f'Sent UDP packet to {self.SERVER_ADDRESS}')
 
-	def _draw_on_screen_data(self, frame, results_face_mesh, img_h, img_w, current_frame_time_ms):
+	def _draw_on_screen_data(self, frame, landmarks: Optional[FaceLandmarks], img_h, img_w, current_frame_time_ms):
 		font_face = cv.FONT_HERSHEY_SIMPLEX
 		font_scale_main = 0.55
 		font_scale_small = 0.45
@@ -1434,7 +1603,7 @@ class Ocapi(object):
 				           text_color_orange, font_thickness)
 				y_pos += line_h
 				status_text = ""
-				if not (results_face_mesh and results_face_mesh.multi_face_landmarks):
+				if not landmarks:
 					status_text = "(No face for pose)"
 				elif self.auto_calibrate_pending:
 					status_text = "(Wait auto-calib)"
@@ -1488,7 +1657,7 @@ class Ocapi(object):
 			           font_thickness)
 			tr_y_pos += line_h
 
-		if results_face_mesh and results_face_mesh.multi_face_landmarks:
+		if landmarks:
 			# Always show eye gaze coordinates if a face is detected
 			l_eye_text = f"L Eye D(xy): ({self.l_dx:.1f}, {self.l_dy:.1f})"
 			r_eye_text = f"R Eye D(xy): ({self.r_dx:.1f}, {self.r_dy:.1f})"
@@ -1541,8 +1710,8 @@ class Ocapi(object):
 		cv.putText(frame, f'FPS: {self.FPS:.1f}', (tl_x, img_h - 10), font_face, font_scale_main, text_color_green,
 		           font_thickness)
 
-		if results_face_mesh and results_face_mesh.multi_face_landmarks:
-			face_landmarks_mp = results_face_mesh.multi_face_landmarks[0]
+		if landmarks and landmarks.mp_multi_face_landmarks and landmarks.mp_multi_face_landmarks.multi_face_landmarks:
+			face_landmarks_mp = landmarks.mp_multi_face_landmarks.multi_face_landmarks[0]
 			if self.SHOW_ALL_FEATURES:
 				mp_drawing.draw_landmarks(image=frame, landmark_list=face_landmarks_mp,
 				                          connections=mp_face_mesh.FACEMESH_TESSELATION,
@@ -1771,11 +1940,11 @@ class Ocapi(object):
 				break
 
 			# We only need to run face mesh and head pose estimation
-			results, _, mesh_points, _ = self._process_face_mesh(frame)
+			landmarks = self.detector.detect(frame)
 
-			if results and results.multi_face_landmarks:
+			if landmarks:
 				# _process_head_pose will see that clustering is pending and append samples
-				self._process_head_pose(mesh_points, img_h, img_w, key_pressed=-1)
+				self._process_head_pose(landmarks, img_h, img_w, key_pressed=-1)
 
 			frame_num += 1
 			if self.PRINT_DATA and frame_num % int(self.FPS or 30) == 0:
@@ -1804,7 +1973,13 @@ class Ocapi(object):
 				(self.output_suffix_part1 if self.split_at_ms is not None else "")
 			self._finalize_part(part_suffix=final_suffix)
 
-		cv.destroyAllWindows()
+		# Wrap GUI cleanup in a broad try/except to prevent crashes on exit
+		# if running in a headless environment or if OpenCV is misconfigured.
+		try:
+			cv.destroyAllWindows()
+		except Exception:
+			pass
+
 		if hasattr(self, 'socket') and self.socket:
 			self.socket.close()
 		if self.PRINT_DATA: self.logger.info("Program exited.")
@@ -1876,19 +2051,19 @@ class Ocapi(object):
 
 				key_pressed = cv.waitKey(1) & 0xFF
 
-				results_face_mesh, face_landmarks_mp, mesh_points, mesh_points_3D_normalized = self._process_face_mesh(
-					frame)
-				self.mesh_points = mesh_points
+				landmarks = self.detector.detect(frame)
+				self.mesh_points = landmarks.raw_mesh_points_2d if landmarks else None
 
-				if results_face_mesh and results_face_mesh.multi_face_landmarks:
-					self._extract_eye_features(mesh_points)
+				if landmarks:
+					self._extract_eye_features(landmarks)
 					self.is_looking_down_explicitly = self._check_downward_look()
-					self._update_blink_count(mesh_points_3D_normalized)
+					if landmarks.raw_mesh_points_3d is not None:
+						self._update_blink_count(landmarks.raw_mesh_points_3d)
 
 					if self.ENABLE_HEAD_POSE:
 						# For clustering, this now uses the pre-calibrated baseline.
 						# For other methods, it performs live calibration if needed.
-						self._process_head_pose(mesh_points, img_h, img_w, key_pressed)
+						self._process_head_pose(landmarks, img_h, img_w, key_pressed)
 						self.face_looks_display_text = self._get_face_looks_text()
 
 				if self.ENABLE_VIDEO_TRIAL_DETECTION:
@@ -1906,14 +2081,14 @@ class Ocapi(object):
 					# If a trial is active and we are NOT in tuning mode, classify gaze.
 					if not self.TUNING_MODE:
 						if self.current_trial_data and self.current_trial_data['active'] and \
-								results_face_mesh and results_face_mesh.multi_face_landmarks:
+								landmarks:
 							self._classify_gaze_for_current_trial(current_frame_time_ms)
 
 				if self.LOG_DATA:
-					self._log_frame_data(current_frame_time_ms, self.frame_count, results_face_mesh, img_w, img_h)
+					self._log_frame_data(current_frame_time_ms, self.frame_count, landmarks, img_w, img_h)
 
 				if self.SHOW_ON_SCREEN_DATA:
-					self._draw_on_screen_data(frame, results_face_mesh, img_h, img_w, current_frame_time_ms)
+					self._draw_on_screen_data(frame, landmarks, img_h, img_w, current_frame_time_ms)
 					cv.imshow("Eye Tracking", frame)
 
 				self._write_video_frame(frame)
