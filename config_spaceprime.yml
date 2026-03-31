@@ -46,7 +46,7 @@ System:
 Files:
   # Corrects video orientation if it was recorded sideways or upside down.
   # Options: 0 (no rotation), 90, 180, 270.
-  ROTATE: 180
+  ROTATE: 90
   # Set to True if the video is a mirror image (e.g., from some webcams).
   FLIP_VIDEO: False
 
@@ -83,7 +83,7 @@ Files:
 Features:
   # --- Detector Selection ---
   # Options: "mediapipe" (Default) or "deeplabcut"
-  DETECTOR_TYPE: "deeplabcut"
+  DETECTOR_TYPE: "mediapipe"
 
   # Path to the exported DeepLabCut model directory (required if DETECTOR_TYPE is "deeplabcut").
   # This folder must contain the exported .pb file and pose_cfg.yaml.
@@ -106,9 +106,9 @@ Features:
   # Maximum number of faces to detect in a frame.
   MAX_NUM_FACES: 1
   # Confidence threshold for the initial face detection. Lower is more lenient.
-  MIN_DETECTION_CONFIDENCE: 0.01
+  MIN_DETECTION_CONFIDENCE: 0.5
   # Confidence threshold for tracking the face across frames. Lower is more lenient.
-  MIN_TRACKING_CONFIDENCE: 0.01
+  MIN_TRACKING_CONFIDENCE: 0.5
   # Use the more detailed (but slower) attention mesh for eyes/lips.
   # Set to False for a performance boost if you only need head pose.
   USE_ATTENTION_MESH: True
@@ -119,7 +119,7 @@ Features:
   # Width of the user's face in millimeters (outer cheekbone to outer cheekbone).
   # This is important for accurate scaling of the 3D head model.
   # Adult is ~150mm. For infants (6-12mo), a value of ~100mm is more appropriate.
-  USER_FACE_WIDTH: 100 # [mm]
+  USER_FACE_WIDTH: 150 # [mm]
   # Number of frames to average for smoothing head pose angles. Higher = smoother but more lag.
   MOVING_AVERAGE_WINDOW: 10
 
@@ -145,7 +145,7 @@ Calibration:
   #                  are looking straight ahead. Good for cooperative users.
   # "manual": No automatic calibration. You must press 'c' to set the baseline.
   # "none": No calibration is performed. Raw angle values are used.
-  METHOD: "clustering"
+  METHOD: "none"
 
   # Duration in seconds at the start of the video to use for automatic calibration.
   CLUSTERING_CALIB_DURATION_SECONDS: 30
@@ -173,7 +173,7 @@ Calibration:
 #--------------------------------------------------------------------------------------
 Trials:
   # Master switch for the entire trial detection and classification system.
-  ENABLE: True
+  ENABLE: False
 
   # --- Trial Onset Detection (via screen brightness) ---
   # Method for defining the stimulus ROI.
@@ -181,7 +181,7 @@ Trials:
   # "dynamic": (NEW) Automatically find the ROI at the start of the video.
   # DISABLED: Set to null or comment out to disable ROI detection.
   # STIMULUS_ROI_METHOD: "dynamic"
-  STIMULUS_ROI_METHOD: "dynamic"
+  STIMULUS_ROI_METHOD: null
 
   # -- Parameters for "dynamic" ROI detection --
   DynamicROI:
