@@ -29,7 +29,7 @@ System:
 
   # Video encoding format for the output file.
   # "mp4v" is recommended for .mp4 files. "XVID" is good for .avi files.
-  OUTPUT_VIDEO_FOURCC: "mp4v"
+  OUTPUT_VIDEO_FOURCC: "XVID"
 
   # --- Socket Communication (for sending data in real-time) ---
   # Master switch to enable sending data over UDP socket.

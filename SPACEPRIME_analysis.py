@@ -13,12 +13,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from ocapi.ocapi import Ocapi
 
 # Configuration
-BASE_PATH = r"\\storage.ipsy1.uni-luebeck.de\IPSY1\Projects\ac\Experiments\running_studies\SPACEPRIME\sourcedata\raw"
-OUTPUT_BASE_PATH = r"\\storage.ipsy1.uni-luebeck.de\IPSY1\Projects\ac\Experiments\running_studies\OCAPI\output\SPACEPRIME"
+BASE_PATH = "/home/maxschulz/IPSY1-Storage/Projects/ac/Experiments/running_studies/SPACEPRIME/sourcedata/raw"
+OUTPUT_BASE_PATH = "/home/maxschulz/IPSY1-Storage/Projects/ac/Experiments/running_studies/OCAPI/output/SPACEPRIME"
 CONFIG_FILE = Path(__file__).parent / "config_spaceprime.yml"
 
 # Subject IDs: 108, 110, 112, ..., 174
-SUBJECT_IDS = list(range(108, 176, 2))  # This generates [108, 110, 112, ..., 174]
+SUBJECT_IDS = [144, 156]  # This generates [108, 110, 112, ..., 174]
 NUM_BLOCKS = 10  # Blocks 0-9
 
 
@@ -55,7 +55,7 @@ def process_subject(subject_id):
 
         try:
             # Create output file path
-            output_video = str(output_dir / f"sub-{subject_id}_block-{block_id}_processed.mp4")
+            output_video = str(output_dir / f"sub-{subject_id}_block-{block_id}_processed.avi")
 
             print(f"Output: {output_video}")
             print("Initializing tracker...")
