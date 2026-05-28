@@ -151,7 +151,7 @@ class PlottingOcapi(Ocapi):
             # Update plot data
             self.line_pitch.set_ydata(self.pitch_history)
             self.line_yaw.set_ydata(self.yaw_history)
-            self.line_roll.set_ydata(self.roll_history)
+            #self.line_roll.set_ydata(self.roll_history)
             
             self.line_ldx.set_ydata(self.ldx_history)
             self.line_ldy.set_ydata(self.ldy_history)
