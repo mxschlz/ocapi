@@ -1,0 +1,352 @@
+#======================================================================================
+# ocapi Configuration File
+#
+# This file controls all operational parameters for the tracker.
+# Sections are organized by function. Read comments carefully before editing.
+#======================================================================================
+
+#--------------------------------------------------------------------------------------
+# 1. System & Performance Settings
+# Controls for processing speed, on-screen display, and video output format.
+#--------------------------------------------------------------------------------------
+System:
+  # If True, prints detailed status updates to the console. Essential for debugging.
+  PRINT_DATA: True
+
+  # Turn tuning mode on or off
+  TUNING_MODE: False
+
+  # If True, shows the video window with all on-screen data overlays.
+  # Set to False for "headless" batch processing to gain a significant speed boost.
+  SHOW_ON_SCREEN_DATA: True
+
+  # --- Performance Tuning ---
+  # To improve speed, you can process a subset of frames.
+  # 1 = Process every frame (most detailed, slowest).
+  # 2 = Process every 2nd frame (faster, good balance).
+  # 3+ = Process every Nth frame (fastest, less temporal detail).
+  FRAME_SKIP: 1
+
+  # Video encoding format for the output file.
+  # "mp4v" is recommended for .mp4 files. "XVID" is good for .avi files.
+  OUTPUT_VIDEO_FOURCC: "XVID"
+
+  # --- Socket Communication (for sending data in real-time) ---
+  # Master switch to enable sending data over UDP socket.
+  USE_SOCKET: False
+  # IP address of the receiving server.
+  SERVER_IP: "127.0.0.1"
+  # Port of the receiving server.
+  SERVER_PORT: 5005
+
+#--------------------------------------------------------------------------------------
+# 2. Input & Output File Settings
+# Defines video orientation, splitting, and naming conventions for output files.
+#--------------------------------------------------------------------------------------
+Files:
+  # Corrects video orientation if it was recorded sideways or upside down.
+  # Options: 0 (no rotation), 90, 180, 270.
+  ROTATE: 0
+  # Set to True if the video is a mirror image (e.g., from some webcams).
+  FLIP_VIDEO: False
+
+  # --- Video Splitting ---
+  # If you need to split a long video into two parts for analysis (e.g., pre/post).
+  # Time in milliseconds (ms) at which to split the video.
+  # Set to null or remove the line to disable splitting.
+  SPLIT_VIDEO_AT_MS: null # Split video if video contains multiple experiments
+
+  # --- Output Filename Prefixes & Suffixes ---
+  # Base name for the main per-frame data log file.
+  OUTPUT_MAIN_LOG_FILENAME_PREFIX: "eye_tracking_log"
+  # Base name for the trial summary log file.
+  OUTPUT_TRIAL_SUMMARY_FILENAME_PREFIX: "trial_summary"
+  # Suffix for files generated from the first part of a split video.
+  OUTPUT_FILENAME_SUFFIX_PART1: "_part1"
+  # Suffix for files generated from the second part of a split video.
+  OUTPUT_FILENAME_SUFFIX_PART2: "_part2"
+
+  # --- Logging Settings ---
+  # Master switch to enable saving data to CSV files.
+  LOG_DATA: True
+  # Format for timestamps in the log files (follows Python's strftime format).
+  TIMESTAMP_FORMAT: "%Y%m%d%H%M%S%f"
+  # If True, logs all 468/478 landmark coordinates. Creates very large files.
+  LOG_ALL_FEATURES: False
+  # If LOG_ALL_FEATURES is True, also log the Z-coordinate for each landmark.
+  LOG_Z_COORD: False
+
+#--------------------------------------------------------------------------------------
+# 3. Core Model & Feature Settings
+# High-level switches for enabling/disabling major features and models.
+#--------------------------------------------------------------------------------------
+Features:
+  # --- Detector Selection ---
+  # Options: "mediapipe" (Default) or "deeplabcut"
+  DETECTOR_TYPE: "mediapipe"
+
+  # Path to the exported DeepLabCut model directory (required if DETECTOR_TYPE is "deeplabcut").
+  # This folder must contain the exported .pb file and pose_cfg.yaml.
+  # Example: Point to the FOLDER, not the file.
+  DLC_MODEL_PATH: r"G:\Meine Ablage\PhD\data\OCAPI\ocapi-Max-2026-02-13\exported-models\DLC_ocapi_resnet_50_iteration-0_shuffle-1"
+
+  # --- DeepLabCut Label Mapping ---
+  # Map Ocapi's required semantic features (keys) to YOUR DeepLabCut model's labels (values).
+  DLC_LABEL_MAPPING:
+    left_iris_center: "pupil_left"
+    right_iris_center: "pupil_right"
+    left_eye_outer_corner: "eye_corner_left"
+    right_eye_outer_corner: "eye_corner_right"
+    nose_tip: "nose"
+    chin: "chin"
+    left_mouth_corner: "mouth_left"
+    right_mouth_corner: "mouth_right"
+
+  # --- MediaPipe Model Settings ---
+  # Maximum number of faces to detect in a frame.
+  MAX_NUM_FACES: 1
+  # Confidence threshold for the initial face detection. Lower is more lenient.
+  MIN_DETECTION_CONFIDENCE: 0.5
+  # Confidence threshold for tracking the face across frames. Lower is more lenient.
+  MIN_TRACKING_CONFIDENCE: 0.5
+  # Use the more detailed (but slower) attention mesh for eyes/lips.
+  # Set to False for a performance boost if you only need head pose.
+  USE_ATTENTION_MESH: True
+
+  # --- Head Pose ---
+  # Master switch to enable or disable all head pose estimation and logging.
+  ENABLE_HEAD_POSE: True
+  # Width of the user's face in millimeters (outer cheekbone to outer cheekbone).
+  # This is important for accurate scaling of the 3D head model.
+  # Adult is ~150mm. For infants (6-12mo), a value of ~100mm is more appropriate.
+  USER_FACE_WIDTH: 150 # [mm]
+  # Number of frames to average for smoothing head pose angles. Higher = smoother but more lag.
+  MOVING_AVERAGE_WINDOW: 10
+
+  # --- Blink Detection ---
+  # Eye Aspect Ratio (EAR) threshold. A lower value means the eyes must be more closed to count as a blink.
+  BLINK_THRESHOLD: 0.51
+  # Number of consecutive frames the EAR must be below the threshold to register a blink.
+  EYE_AR_CONSEC_FRAMES: 1
+
+  # --- On-Screen Display ---
+  # If True, draws all 468+ facial landmarks. Very slow, for debugging only.
+  SHOW_ALL_FEATURES: False
+
+#--------------------------------------------------------------------------------------
+# 4. Head Pose Calibration
+# Determines the "neutral" or "forward-looking" baseline pose.
+#--------------------------------------------------------------------------------------
+Calibration:
+  # Method to use for calibration.
+  # "clustering": (RECOMMENDED FOR INFANTS) A two-pass method that analyzes a period of the video
+  #               to find the most common head pose and sets it as the baseline. Most robust.
+  # "gaze_informed": A single-pass method that collects samples only when the user's eyes
+  #                  are looking straight ahead. Good for cooperative users.
+  # "manual": No automatic calibration. You must press 'c' to set the baseline.
+  # "none": No calibration is performed. Raw angle values are used.
+  METHOD: "none"
+
+  # Duration in seconds at the start of the video to use for automatic calibration.
+  CLUSTERING_CALIB_DURATION_SECONDS: 30
+
+  # --- Settings for "clustering" method ---
+  Clustering:
+    # Max distance (in degrees) between two head poses to be in the same cluster.
+    # INCREASE if no cluster is found. DECREASE for a tighter, more precise baseline.
+    DBSCAN_EPS: 3.0
+    # Minimum number of frames that must be in a cluster to be considered a valid baseline.
+    DBSCAN_MIN_SAMPLES: 15
+
+  # --- Settings for "gaze_informed" method ---
+  GazeInformed:
+    # Minimum number of valid samples required to complete calibration.
+    MIN_SAMPLES: 30
+    # Allowable horizontal/vertical deviation (in pixels) of the iris from the eye corner
+    # for a frame to be considered "looking forward" and used for calibration.
+    EYE_DX_RANGE: [-20, 20]
+    EYE_DY_RANGE: [-20, 20]
+
+#--------------------------------------------------------------------------------------
+# 5. Trial Detection & Gaze Classification
+# Logic for identifying trials and classifying the user's gaze during those trials.
+#--------------------------------------------------------------------------------------
+Trials:
+  # Master switch for the entire trial detection and classification system.
+  ENABLE: False
+
+  # --- Trial Onset Detection (via screen brightness) ---
+  # Method for defining the stimulus ROI.
+  # "static": Manually define the coordinates below.
+  # "dynamic": (NEW) Automatically find the ROI at the start of the video.
+  # DISABLED: Set to null or comment out to disable ROI detection.
+  # STIMULUS_ROI_METHOD: "dynamic"
+  STIMULUS_ROI_METHOD: null
+
+  # -- Parameters for "dynamic" ROI detection --
+  DynamicROI:
+    # If VISUALIZE_ROI_SEARCH is True, opens a window during the search pass to show the grid, cell activity, and the final detected ROI. Press any key to continue.
+    VISUALIZE_ROI_SEARCH: False
+    # (NEW) The time in seconds into the video to START searching for the ROI.
+    # Set this to just before you expect the first stimulus to appear.
+    SEARCH_START_SECONDS: 300 # Example: Start search at 3 minutes
+    # Duration (in seconds) at the start of the video to search for the active region.
+    SEARCH_DURATION_SECONDS: 10
+    # How many rows and columns to divide the screen into for analysis.
+    # More divisions are more precise but use more memory. [columns, rows]
+    GRID_DIVISIONS: [30, 25]
+    # (NEW) Threshold for a grid cell to be considered "active".
+    # This is a percentage of the most active cell's variance.
+    # Lower values (e.g., 25) create a larger, more inclusive ROI.
+    # Higher values (e.g., 50) create a tighter, more focused ROI.
+    ACTIVITY_THRESHOLD_PERCENT: 50
+    # (Optional) You can provide a search area [x, y, w, h] to constrain the search
+    # and prevent finding spurious activity in irrelevant parts of the screen.
+    # If commented out, the whole screen is used.
+    SEARCH_AREA: [640, 720, 640, 360]
+    MorphologicalCleaning:
+      ENABLE_CLEANING: True
+      # How many pixels to erode (remove noise). Range: 1-5.
+      ERODE_ITERATIONS: 1
+      # How many pixels to dilate (fill gaps). Range: 1-5.
+      DILATE_ITERATIONS: 2
+      # If True, it finds all separate active regions and keeps only the largest one.
+      KEEP_LARGEST_BLOB_ONLY: True
+
+    # Add padding to the final detected ROI to ensure it fully captures the stimulus.
+    ROIPadding:
+      # If True, the padding logic below will be applied.
+      ENABLE_PADDING: True
+      # Padding to add, as a percentage of the detected ROI's width and height.
+      # A value of 20 means the final ROI will be 20% wider and 20% taller.
+      # This is generally more robust than using fixed pixel padding.
+      PADDING_PERCENTAGE: 0
+
+  # (Used if STIMULUS_ROI_METHOD is "static")
+  # Defines the Region of Interest [x, y, width, height] on the video frame to monitor for a stimulus.
+  STIMULUS_ROI_COORDS: [820, 630, 300, 300]
+  # --- Trial Onset Detection Method ---
+  # Method for detecting the start of a trial based on ROI brightness.
+  # "statistical": (NEW & RECOMMENDED) Detects a trial if the brightness is a certain
+  #                number of standard deviations above the baseline mean. Most robust.
+  # "factor":      Detects a trial if brightness > (baseline_mean * factor). Good for high contrast.
+  # "absolute":    Detects a trial if brightness > absolute_value. Least robust.
+  TRIAL_ONSET_DETECTION_METHOD: "statistical"
+
+  # -- Parameters for "statistical" method --
+  Statistical:
+    # A trial is detected if ROI brightness > (baseline_mean + N * baseline_std_dev).
+    # A value of 3-5 is a good starting point. Higher is less sensitive.
+    ROI_BRIGHTNESS_STD_DEV_THRESHOLD: 1.0
+
+    # (NEW & RECOMMENDED) To prevent false positives on very dark/stable baselines, this
+    # adds a minimum factor. The final threshold will be the HIGHER of the statistical
+    # calculation and (baseline_mean * this factor).
+    # Set to 1.0 to disable. For high-contrast stimuli, 2.0 or 3.0 is a good start.
+    ROI_BRIGHTNESS_MIN_FACTOR: 1.0
+
+  # -- Parameters for "factor" method --
+  Factor:
+    # A stimulus is detected if the ROI brightness > (baseline * this factor).
+    ROI_BRIGHTNESS_THRESHOLD_FACTOR: 1.5
+
+  # -- Parameters for "absolute" method --
+  Absolute:
+    # Use a fixed brightness threshold (0-255).
+    ROI_ABSOLUTE_BRIGHTNESS_THRESHOLD: 180
+
+  # Number of initial non-trial frames used to establish a baseline "dark" screen brightness.
+  ROI_BRIGHTNESS_BASELINE_FRAMES: 5
+
+  # --- Trial Timing ---
+  # How long the stimulus is considered "on" after initial detection.
+  STIMULUS_DURATION_MS: 800
+  # How long the trial continues *after* the stimulus turns off.
+  POST_STIMULUS_TRIAL_DURATION_MS: 0
+  # Minimum time required between the end of one trial and the start of the next.
+  MIN_INTER_TRIAL_INTERVAL_MS: 1000
+
+  # Minimum percentage of the STIMULUS_DURATION_MS that gaze must be "on stimulus"
+  # for the entire trial to be classified as a "Looked (1)".
+  LOOK_TO_STIMULUS_THRESHOLD_PERCENT: 11
+
+  # --- Gaze Classification (During Stimulus Period) ---
+  # Method to determine if the user is looking at the stimulus.
+  # "compensatory_gaze": (ADVANCED) Checks if eyes compensate for head turns.
+  #                      Use this to capture looks where the head is turned but
+  #                      eyes remain on the stimulus.
+  # "eye_gaze_with_head_filter": (RECOMMENDED) Uses iris position but filters out frames
+  #                                where the head is turned too far away.
+  # "eye_gaze_only": Uses only the relative position of the iris in the eye socket.
+  # "head_pose_only": Legacy method. Uses only the calibrated head pose angles.
+  GAZE_CLASSIFICATION_METHOD: "head_pose_only"
+
+  # -- Parameters for the "compensatory_gaze" method --
+  # This method allows for gaze to be "on stimulus" even if the head is turned,
+  # as long as the eyes are turned in the opposite direction to compensate.
+  # TUNE THESE RANGES BASED ON YOUR SUBJECT'S DATA.
+
+  # Condition 1: Head is looking forward.
+  COMPENSATORY_HEAD_YAW_RANGE_CENTER: [-10, 10]
+  # Required eye gaze sum when head is centered (should be near zero).
+  COMPENSATORY_EYE_SUM_RANGE_CENTER: [-9, 9]
+
+  # Condition 2: Head is turned to the subject's left.
+  COMPENSATORY_HEAD_YAW_RANGE_LEFT: [-70, -15]
+  # Required eye gaze sum for a left head turn (eyes must look right -> positive sum).
+  COMPENSATORY_EYE_SUM_RANGE_LEFT_TURN: [-10, 10]
+
+  # Condition 3: Head is turned to the subject's right.
+  COMPENSATORY_HEAD_YAW_RANGE_RIGHT: [15, 70]
+  # Required eye gaze sum for a right head turn (eyes must look left -> negative sum).
+  COMPENSATORY_EYE_SUM_RANGE_RIGHT_TURN: [-10, 10]
+
+  # A general pitch filter is still applied for all conditions.
+  COMPENSATORY_HEAD_PITCH_RANGE: [-15, 15]
+
+  # -- Parameters for the "head_filter" --
+  # Defines the allowable head pose range (in degrees) for eye gaze to be considered valid.
+  HEAD_POSE_FILTER_PITCH_RANGE: [-15, 15]
+  HEAD_POSE_FILTER_YAW_RANGE: [-15, 15]
+
+  # -- Parameters for "head_pose_only" method --
+  # Defines the "on stimulus" head pose range (in degrees from calibrated neutral).
+  STIMULUS_PITCH_RANGE: [-20, 20]
+  STIMULUS_YAW_RANGE: [-20, 20]
+
+  # -- Parameters for "eye_gaze" methods --
+  # Define the "on stimulus" iris position ranges (in pixels, relative to eye corner).
+  # YOU MUST TUNE THESE FOR YOUR SPECIFIC SETUP.
+  # (New/Recommended) Alternative to DX_RANGE for horizontal gaze classification.
+  # To use this, set a value like 10. To disable and use the old DX_RANGE method, set to 999.
+  GAZE_DX_SUM_THRESHOLD: 999
+  STIMULUS_LEFT_IRIS_DX_RANGE: [-20, -10]
+  STIMULUS_LEFT_IRIS_DY_RANGE: [0, 5]
+  STIMULUS_RIGHT_IRIS_DX_RANGE: [10, 20]
+  STIMULUS_RIGHT_IRIS_DY_RANGE: [-5, 0]
+
+  # -- Gaze Refinements --
+  # Thresholds to detect an explicit downward look, which helps prevent
+  # counting a downward glance as a blink. Tune these based on your subject's data.
+  DOWNWARD_LOOK_LEFT_IRIS_DY_MIN: 10
+  DOWNWARD_LOOK_RIGHT_IRIS_DY_MIN: 10
+
+#--------------------------------------------------------------------------------------
+# 6. Landmark Indices (Advanced)
+# These map MediaPipe's output to named facial features.
+# It is STRONGLY recommended NOT to change these unless you are an expert
+# and MediaPipe has updated its model.
+#--------------------------------------------------------------------------------------
+Landmarks:
+  LEFT_EYE_IRIS: [474, 475, 476, 477]
+  RIGHT_EYE_IRIS: [469, 470, 471, 472]
+  RIGHT_EYE_POINTS: [33, 160, 159, 158, 133, 153, 145, 144]
+  LEFT_EYE_POINTS: [362, 385, 386, 387, 263, 373, 374, 380]
+  RIGHT_EYE_OUTER_CORNER: 33
+  LEFT_EYE_OUTER_CORNER: 263
+  NOSE_TIP_INDEX: 4
+  CHIN_INDEX: 152
+  RIGHT_MOUTH_CORNER: 61
+  LEFT_MOUTH_CORNER: 291
+  # Indices used for the solvePnP head pose algorithm.
+  _indices_pose: [4, 152, 263, 33, 291, 61] # Nose, Chin, L-Eye, R-Eye, L-Mouth, R-Mouth
