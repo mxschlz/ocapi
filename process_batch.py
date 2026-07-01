@@ -5,7 +5,7 @@ import pathlib
 import sys
 
 
-def process_batch(input_folder, output_folder, config_file):
+def process_batch(input_folder, output_folder, config_file, demo=False):
 	"""
 	This function contains the core video processing logic.
 	It's called only when the script is running inside the target conda environment.
@@ -41,11 +41,15 @@ def process_batch(input_folder, output_folder, config_file):
 	print(f"Scanning for videos in: {input_folder}")
 
 	# Use glob to find all video files, similar to retrieve_head_gaze_data.py
-	# We add 'trimmed' to the path to specifically target only the trimmed videos
-	# and ignore others (e.g., in an 'original' directory).
+	# We first check for videos in subfolders under 'trimmed', otherwise check direct folder contents
 	video_files = [p for ext in video_extensions for p in input_path.glob(f"**/trimmed/*{ext}")]
+	if not video_files:
+		video_files = [p for ext in video_extensions for p in input_path.glob(f"*{ext}")]
 
 	for video_input_path in sorted(video_files):
+		if demo and videos_processed_count >= 1:
+			print("\n--- Demonstration Mode: Stopped after processing 1 video ---")
+			break
 		base_name = video_input_path.stem
 		print(f"\nProcessing video: {video_input_path}")
 		
@@ -162,7 +166,8 @@ if __name__ == "__main__":
 	parser.add_argument('-i', '--input', required=True, help="Folder containing the input videos (e.g., '.../trimmed/').")
 	parser.add_argument('-o', '--output', required=True, help="Folder to save processed videos and logs.")
 	parser.add_argument('-c', '--config', default="config.yml", help="Path to the configuration file (e.g., 'config.yml').")
+	parser.add_argument('-d', '--demo', action='store_true', help="Run in demonstration mode (stop after processing 1 video).")
 
 	args = parser.parse_args()
 
-	process_batch(args.input, args.output, args.config)
+	process_batch(args.input, args.output, args.config, demo=args.demo)
