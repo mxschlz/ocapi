@@ -69,6 +69,8 @@ class PlottingOcapi(Ocapi):
         # --- Combined Video Saving Setup ---
         self.combined_out = None
         self.has_started_recording = False
+        self.calibrated_frames_count = 0
+        self.temp_frames_buffer = []
         
         # We don't initialize the writer here because we want to wait for calibration
         # and we need the dimensions of both the webcam frame and the plot frame
@@ -128,7 +130,7 @@ class PlottingOcapi(Ocapi):
         # Only update buffers and save frames IF we are calibrated
         if self.calibrated:
             # Clear buffers on the very first frame of calibration to start fresh
-            if not self.has_started_recording:
+            if not self.has_started_recording and self.calibrated_frames_count == 0:
                 self.pitch_history = deque([0] * self.history_length, maxlen=self.history_length)
                 self.yaw_history = deque([0] * self.history_length, maxlen=self.history_length)
                 self.roll_history = deque([0] * self.history_length, maxlen=self.history_length)
@@ -136,6 +138,9 @@ class PlottingOcapi(Ocapi):
                 self.ldy_history = deque([0] * self.history_length, maxlen=self.history_length)
                 self.rdx_history = deque([0] * self.history_length, maxlen=self.history_length)
                 self.rdy_history = deque([0] * self.history_length, maxlen=self.history_length)
+                if hasattr(self, 'fps_history'):
+                    self.fps_history.clear()
+                self.temp_frames_buffer = []
                 logging.info("Calibration confirmed. Starting data recording and plotting...")
 
             # Collect data for plots
@@ -179,14 +184,22 @@ class PlottingOcapi(Ocapi):
             # Concatenate horizontally
             combined_frame = np.hstack((webcam_padded, plot_padded))
             
-            # Initialize writer on the first calibrated frame
+            # Initialize writer and write the combined frame
             if not self.has_started_recording:
-                self._init_combined_video_writer(webcam_padded, plot_padded)
-                self.has_started_recording = True
-
-            # Write the combined frame
-            if self.combined_out:
-                self.combined_out.write(combined_frame)
+                self.calibrated_frames_count += 1
+                self.temp_frames_buffer.append(combined_frame)
+                
+                # Initialize writer after gathering a few slow-plotting frames
+                if self.calibrated_frames_count >= 15:
+                    self._init_combined_video_writer(webcam_padded, plot_padded)
+                    self.has_started_recording = True
+                    if self.combined_out:
+                        for buffered_frame in self.temp_frames_buffer:
+                            self.combined_out.write(buffered_frame)
+                    self.temp_frames_buffer = None
+            else:
+                if self.combined_out:
+                    self.combined_out.write(combined_frame)
 
     def _write_video_frame(self, frame):
         # Override the parent method so it doesn't try to write to the default writer
