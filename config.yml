@@ -20,6 +20,11 @@ System:
   # Set to False for "headless" batch processing to gain a significant speed boost.
   SHOW_ON_SCREEN_DATA: True
 
+  # If True, skips OpenCV frame-by-frame decoding when pre-extracted CSV data is found.
+  # This provides a massive speedup (~0.1s total processing time) and avoids memory crashes.
+  # Set to False if you want to visually export output videos.
+  SKIP_VIDEO_DECODING: True
+
   # --- Performance Tuning ---
   # To improve speed, you can process a subset of frames.
   # 1 = Process every frame (most detailed, slowest).
@@ -46,7 +51,7 @@ System:
 Files:
   # Corrects video orientation if it was recorded sideways or upside down.
   # Options: 0 (no rotation), 90, 180, 270.
-  ROTATE: 180
+  ROTATE: 0
   # Set to True if the video is a mirror image (e.g., from some webcams).
   FLIP_VIDEO: False
 
@@ -147,8 +152,16 @@ Calibration:
   # "none": No calibration is performed. Raw angle values are used.
   METHOD: "clustering"
 
+  # --- Setup-Specific Geometric Camera Offsets ---
+  # Default offsets to align the camera coordinate space with the stimulus screen.
+  # Added for unseen videos where subject-specific optimization is unavailable.
+  # Set to 0.0 for eye_gaze methods since gaze baseline is self-calibrating.
+  CALIBRATION_YAW_SHIFT: 0.0
+  CALIBRATION_PITCH_SHIFT: 0.0
+
   # Duration in seconds at the start of the video to use for automatic calibration.
-  CLUSTERING_CALIB_DURATION_SECONDS: 30
+  # Set to 1500s to cover the entire session (full-session calibration).
+  CLUSTERING_CALIB_DURATION_SECONDS: 1500
 
   # --- Settings for "clustering" method ---
   Clustering:
@@ -268,62 +281,64 @@ Trials:
 
   # Minimum percentage of the STIMULUS_DURATION_MS that gaze must be "on stimulus"
   # for the entire trial to be classified as a "Looked (1)".
-  LOOK_TO_STIMULUS_THRESHOLD_PERCENT: 11
+  LOOK_TO_STIMULUS_THRESHOLD_PERCENT: 20
 
   # --- Gaze Classification (During Stimulus Period) ---
   # Method to determine if the user is looking at the stimulus.
   # "compensatory_gaze": (ADVANCED) Checks if eyes compensate for head turns.
   #                      Use this to capture looks where the head is turned but
   #                      eyes remain on the stimulus.
+  # "ml_classifier": (NEW) Uses a Gradient Boosting machine learning model trained on all subjects.
   # "eye_gaze_with_head_filter": (RECOMMENDED) Uses iris position but filters out frames
   #                                where the head is turned too far away.
   # "eye_gaze_only": Uses only the relative position of the iris in the eye socket.
   # "head_pose_only": Legacy method. Uses only the calibrated head pose angles.
-  GAZE_CLASSIFICATION_METHOD: "head_pose_only"
+  GAZE_CLASSIFICATION_METHOD: "ml_classifier"
 
   # -- Parameters for the "compensatory_gaze" method --
   # This method allows for gaze to be "on stimulus" even if the head is turned,
   # as long as the eyes are turned in the opposite direction to compensate.
   # TUNE THESE RANGES BASED ON YOUR SUBJECT'S DATA.
 
-  # Condition 1: Head is looking forward.
-  COMPENSATORY_HEAD_YAW_RANGE_CENTER: [-10, 10]
-  # Required eye gaze sum when head is centered (should be near zero).
-  COMPENSATORY_EYE_SUM_RANGE_CENTER: [-9, 9]
+  # Condition 1: Head is looking forward (within this yaw range).
+  COMPENSATORY_HEAD_YAW_RANGE_CENTER: [-25, 25]
+  # Eye sum when head is centered: disabled (same behavior as head_pose_only).
+  COMPENSATORY_EYE_SUM_RANGE_CENTER: [-999, 999]
 
-  # Condition 2: Head is turned to the subject's left.
-  COMPENSATORY_HEAD_YAW_RANGE_LEFT: [-70, -15]
-  # Required eye gaze sum for a left head turn (eyes must look right -> positive sum).
-  COMPENSATORY_EYE_SUM_RANGE_LEFT_TURN: [-10, 10]
+  # Condition 2: Head is turned to the subject's left (negative yaw).
+  COMPENSATORY_HEAD_YAW_RANGE_LEFT: [-70, -25]
+  # Eye sum for left head turn: eyes must look rightward (positive sum).
+  COMPENSATORY_EYE_SUM_RANGE_LEFT_TURN: [2, 30]
 
-  # Condition 3: Head is turned to the subject's right.
-  COMPENSATORY_HEAD_YAW_RANGE_RIGHT: [15, 70]
-  # Required eye gaze sum for a right head turn (eyes must look left -> negative sum).
-  COMPENSATORY_EYE_SUM_RANGE_RIGHT_TURN: [-10, 10]
+  # Condition 3: Head is turned to the subject's right (positive yaw).
+  COMPENSATORY_HEAD_YAW_RANGE_RIGHT: [25, 70]
+  # Eye sum for right head turn: eyes must look leftward (negative sum).
+  COMPENSATORY_EYE_SUM_RANGE_RIGHT_TURN: [-30, -2]
 
   # A general pitch filter is still applied for all conditions.
-  COMPENSATORY_HEAD_PITCH_RANGE: [-15, 15]
+  COMPENSATORY_HEAD_PITCH_RANGE: [-25, 25]
 
   # -- Parameters for the "head_filter" --
   # Defines the allowable head pose range (in degrees) for eye gaze to be considered valid.
-  HEAD_POSE_FILTER_PITCH_RANGE: [-15, 15]
-  HEAD_POSE_FILTER_YAW_RANGE: [-15, 15]
+  HEAD_POSE_FILTER_PITCH_RANGE: [-30.0, 30.0]
+  HEAD_POSE_FILTER_YAW_RANGE: [-25.0, 25.0]
 
   # -- Parameters for "head_pose_only" method --
   # Defines the "on stimulus" head pose range (in degrees from calibrated neutral).
-  STIMULUS_PITCH_RANGE: [-20, 20]
-  STIMULUS_YAW_RANGE: [-20, 20]
+  STIMULUS_PITCH_RANGE: [-20.0, 20.0]
+  STIMULUS_YAW_RANGE: [-20.0, 20.0]
 
   # -- Parameters for "eye_gaze" methods --
   # Define the "on stimulus" iris position ranges (in pixels, relative to eye corner).
   # YOU MUST TUNE THESE FOR YOUR SPECIFIC SETUP.
   # (New/Recommended) Alternative to DX_RANGE for horizontal gaze classification.
   # To use this, set a value like 10. To disable and use the old DX_RANGE method, set to 999.
-  GAZE_DX_SUM_THRESHOLD: 999
+  GAZE_DX_SUM_THRESHOLD: 3.0
+  EYE_HEAD_COMPENSATION_BETA: 0.0
   STIMULUS_LEFT_IRIS_DX_RANGE: [-20, -10]
-  STIMULUS_LEFT_IRIS_DY_RANGE: [0, 5]
+  STIMULUS_LEFT_IRIS_DY_RANGE: [-5.0, 5.0]
   STIMULUS_RIGHT_IRIS_DX_RANGE: [10, 20]
-  STIMULUS_RIGHT_IRIS_DY_RANGE: [-5, 0]
+  STIMULUS_RIGHT_IRIS_DY_RANGE: [-5.0, 5.0]
 
   # -- Gaze Refinements --
   # Thresholds to detect an explicit downward look, which helps prevent
