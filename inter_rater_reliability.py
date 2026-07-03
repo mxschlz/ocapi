@@ -45,10 +45,30 @@ def calculate_cohens_kappa(file_path1, file_path2, column_index1=0, column_index
 
         rater1_data, rater2_data = rater_data_list[0], rater_data_list[1]
 
+        # Harmonize lengths first and reset index for positional alignment
+        if len(rater1_data) != len(rater2_data):
+            min_len = min(len(rater1_data), len(rater2_data))
+            print(f"Warning: Files have different lengths ({len(rater1_data)} vs {len(rater2_data)}). Trimming to {min_len} rows.")
+            rater1_data = rater1_data.iloc[:min_len].reset_index(drop=True)
+            rater2_data = rater2_data.iloc[:min_len].reset_index(drop=True)
+        else:
+            rater1_data = rater1_data.reset_index(drop=True)
+            rater2_data = rater2_data.reset_index(drop=True)
+
+        # Drop any row containing NaNs
+        combined = pd.concat([rater1_data, rater2_data], axis=1)
+        combined.columns = ['r1', 'r2']
+        combined = combined.dropna()
+        if len(combined) == 0:
+            print("Error: After dropping NaNs, no data is left.")
+            return None, None
+        rater1_data = combined['r1']
+        rater2_data = combined['r2']
+
         # --- New: Harmonize different coding schemes for 'False' (0 vs 2) ---
         # Check if one rater uses {1, 0} and the other uses {1, 2} for (True, False)
-        unique_vals1 = set(rater1_data.unique())
-        unique_vals2 = set(rater2_data.unique())
+        unique_vals1 = set(rater1_data.dropna().unique())
+        unique_vals2 = set(rater2_data.dropna().unique())
 
         # Define the expected coding schemes
         scheme_a = {1, 2}
@@ -60,18 +80,6 @@ def calculate_cohens_kappa(file_path1, file_path2, column_index1=0, column_index
         elif (unique_vals2.issubset(scheme_a) and unique_vals1.issubset(scheme_b)):
             print("  - Info: Harmonizing coding schemes. Converting 0s to 2s for rater 1.")
             rater1_data = rater1_data.replace(0, 2)
-
-        if len(rater1_data) != len(rater2_data):
-            # Try to align by trimming the longer one, which can happen if one file has an extra empty row etc.
-            min_len = min(len(rater1_data), len(rater2_data))
-            print(f"Warning: Files have different lengths ({len(rater1_data)} vs {len(rater2_data)}). Trimming to {min_len} rows.")
-            rater1_data = rater1_data.head(min_len)
-            rater2_data = rater2_data.head(min_len)
-
-
-        if len(rater1_data) == 0:
-            print("Error: Files are empty or the specified column could not be read.")
-            return None, None
 
         kappa = cohen_kappa_score(rater1_data, rater2_data, labels=labels)
 
