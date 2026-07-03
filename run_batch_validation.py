@@ -2,6 +2,7 @@
 import os
 import sys
 import glob
+import gc
 import pandas as pd
 from datetime import datetime
 
@@ -31,15 +32,36 @@ def run_validation():
     for ext in video_extensions:
         video_files.extend(glob.glob(os.path.join(video_dir, f"*{ext}")))
     
+    # To process specific subjects, list them here. Set to None or empty list to process all.
+    target_subjects = None
+    force_rerun = False
+    if target_subjects:
+        video_files = [f for f in video_files if any(sub in os.path.basename(f) for sub in target_subjects)]
     video_files = sorted(video_files)
-    print(f"Found {len(video_files)} video files to process in {video_dir}.")
+    if target_subjects:
+        print(f"Found {len(video_files)} video files to process in {video_dir} ({', '.join(target_subjects)}).")
+    else:
+        print(f"Found {len(video_files)} video files to process in {video_dir} (all subjects).")
     
     results = []
     
-    for video_path in video_files:
+    for idx, video_path in enumerate(video_files):
+        # Explicitly run garbage collection at the start of each iteration
+        gc.collect()
+        
+        # Get memory usage if psutil is available
+        mem_info_str = ""
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            mem_mb = process.memory_info().rss / 1024 / 1024
+            mem_info_str = f" [RAM: {mem_mb:.1f} MB]"
+        except Exception:
+            pass
+
         base_name = os.path.splitext(os.path.basename(video_path))[0]
         print(f"\n{'-'*40}")
-        print(f"Processing Subject/Session from video: {os.path.basename(video_path)}")
+        print(f"[{idx+1}/{len(video_files)}] Processing: {os.path.basename(video_path)}{mem_info_str}")
         
         # Parse subject and session
         try:
@@ -71,7 +93,11 @@ def run_validation():
         # 2. Find corresponding human coding files
         rater1_file = os.path.join(rater_1_dir, f"{subject_sess}_VideoCoding.xlsx")
         rater2_file = os.path.join(rater_2_dir, f"{subject_sess}_VideoCoding.xlsx")
-        
+        if not os.path.exists(rater2_file):
+            glob_matches = glob.glob(os.path.join(rater_2_dir, f"{subject_sess}*"))
+            if glob_matches:
+                rater2_file = glob_matches[0]
+                
         if not os.path.exists(rater1_file):
             # Try matching with glob if exact match not found
             glob_matches = glob.glob(os.path.join(rater_1_dir, f"{subject_sess}*"))
@@ -81,49 +107,65 @@ def run_validation():
                 print(f"  Skipping: Ground truth coding file not found for {subject_sess} in {rater_1_dir}")
                 continue
                 
-        # 3. Initialize Ocapi and run
-        print(f"  Initializing Ocapi tracker...")
+        # 3. Check for existing summary file from today to support crash resumption
+        summary_pattern = os.path.join(output_log_dir, f"{subject_sess}_trial_summary_20260702_*.csv")
+        existing_summaries = glob.glob(summary_pattern)
+        
+        # Also check for any summary from today (using current date format)
+        today_str = datetime.now().strftime("%Y%m%d")
+        if not existing_summaries:
+            summary_pattern = os.path.join(output_log_dir, f"{subject_sess}_trial_summary_{today_str}_*.csv")
+            existing_summaries = glob.glob(summary_pattern)
+            
+        generated_summary_file = None
+        if existing_summaries and not force_rerun:
+            generated_summary_file = max(existing_summaries, key=os.path.getmtime)
+            print(f"  Bypassing Ocapi tracker: Found existing trial summary from today: {os.path.basename(generated_summary_file)}")
+            
         try:
-            tracker = Ocapi(
-                subject_id=subject_id,
-                session=session,
-                config_file_path="config.yml",
-                WEBCAM=None,
-                VIDEO_INPUT=video_path,
-                VIDEO_OUTPUT=None, # Disable output video encoding for speed
-                TRACKING_DATA_LOG_FOLDER=output_log_dir
-            )
-            # Ensure visual elements are disabled
-            tracker.SHOW_ON_SCREEN_DATA = False
-            
-            # EEG synchronization
-            print(f"  Synchronizing with EEG data...")
-            tracker.sync_with_eeg_and_set_onsets(
-                header_file=eeg_header_file,
-                marker_file=eeg_marker_file,
-                stimulus_description="Stimulus",
-                events_of_interest=["S 21", "S 22", "S 23", "S 24"]
-            )
-            
-            print(f"  Running tracking analysis...")
-            run_start_time = datetime.now()
-            tracker.run()
-            
-            # Find the generated trial summary file
-            # Sleep briefly to ensure file handle is released
-            import time
-            time.sleep(1)
-            
-            summary_pattern = os.path.join(output_log_dir, f"{subject_id}_trial_summary*.csv")
-            generated_files = glob.glob(summary_pattern)
-            if not generated_files:
-                raise FileNotFoundError(f"No trial summary files generated matching pattern {summary_pattern}")
+            if generated_summary_file is None:
+                # Initialize Ocapi and run
+                print(f"  Initializing Ocapi tracker...")
+                tracker = Ocapi(
+                    subject_id=subject_id,
+                    session=session,
+                    config_file_path="config.yml",
+                    WEBCAM=None,
+                    VIDEO_INPUT=video_path,
+                    VIDEO_OUTPUT=None, # Disable output video encoding for speed
+                    TRACKING_DATA_LOG_FOLDER=output_log_dir
+                )
+                # Ensure visual elements are disabled
+                tracker.SHOW_ON_SCREEN_DATA = False
                 
-            # Filter files created during this run
-            run_files = [f for f in generated_files if os.path.getmtime(f) > run_start_time.timestamp() - 5]
-            if not run_files:
-                raise FileNotFoundError(f"Could not find the trial summary file created during this run.")
-            generated_summary_file = max(run_files, key=os.path.getmtime)
+                # EEG synchronization
+                print(f"  Synchronizing with EEG data...")
+                tracker.sync_with_eeg_and_set_onsets(
+                    header_file=eeg_header_file,
+                    marker_file=eeg_marker_file,
+                    stimulus_description="Stimulus",
+                    events_of_interest=["S 21", "S 22", "S 23", "S 24"]
+                )
+                
+                print(f"  Running tracking analysis...")
+                run_start_time = datetime.now()
+                tracker.run()
+                
+                # Find the generated trial summary file
+                # Sleep briefly to ensure file handle is released
+                import time
+                time.sleep(1)
+                
+                summary_pattern = os.path.join(output_log_dir, f"{subject_sess}_trial_summary*.csv")
+                generated_files = glob.glob(summary_pattern)
+                if not generated_files:
+                    raise FileNotFoundError(f"No trial summary files generated matching pattern {summary_pattern}")
+                    
+                # Filter files created during this run
+                run_files = [f for f in generated_files if os.path.getmtime(f) > run_start_time.timestamp() - 5]
+                if not run_files:
+                    raise FileNotFoundError(f"Could not find the trial summary file created during this run.")
+                generated_summary_file = max(run_files, key=os.path.getmtime)
             
             # 4. Calculate Cohen's Kappa
             print(f"  Calculating Cohen's Kappa against Rater 1: {os.path.basename(rater1_file)}")
@@ -174,6 +216,10 @@ def run_validation():
             import traceback
             traceback.print_exc()
             continue
+        finally:
+            if 'tracker' in locals():
+                del tracker
+            gc.collect()
 
     print("\n" + "=" * 80)
     print("                       VALIDATION SUMMARY TABLE")
