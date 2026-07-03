@@ -526,9 +526,13 @@ class Ocapi(object):
 			self.all_trials_summary = []
 			self.last_trial_end_time_ms = -getattr(self, "MIN_INTER_TRIAL_INTERVAL_MS", 1000)
 			self.roi_brightness_samples = []
+			self.roi_difference_samples = []
 			self.roi_baseline_mean = None
 			self.roi_baseline_std_dev = None
+			self.roi_difference_baseline_mean = None
+			self.roi_difference_baseline_std = None
 			self.last_trial_result_text = ""
+			self.prev_gray_roi = None
 			# Load the new gaze threshold and head compensation parameters with safe defaults
 			self.GAZE_DX_SUM_THRESHOLD = getattr(self, "GAZE_DX_SUM_THRESHOLD", 999)
 			self.EYE_HEAD_COMPENSATION_BETA = getattr(self, "EYE_HEAD_COMPENSATION_BETA", 0.0)
@@ -1090,11 +1094,12 @@ class Ocapi(object):
 
 		# --- 2. Seek to the start of the search interval ---
 		if search_start_sec > 0:
-			start_time_ms = search_start_sec * 1000
-			self.cap.set(cv.CAP_PROP_POS_MSEC, start_time_ms)
+			target_frame = int(search_start_sec * self.FPS)
+			self.cap.set(cv.CAP_PROP_POS_FRAMES, target_frame)
 			if self.PRINT_DATA:
+				current_pos_frame = self.cap.get(cv.CAP_PROP_POS_FRAMES)
 				current_pos_ms = self.cap.get(cv.CAP_PROP_POS_MSEC)
-				self.logger.info(f"Seeking video to {start_time_ms}ms... Current position is now ~{current_pos_ms:.0f}ms.")
+				self.logger.info(f"Seeking video to frame {target_frame} ({search_start_sec}s)... Current position: frame {current_pos_frame:.0f} (~{current_pos_ms:.0f}ms).")
 
 		# --- 3. Collect brightness data ---
 		cell_brightness_history = np.zeros((grid_rows, grid_cols, frame_limit), dtype=np.float32)
@@ -1543,47 +1548,59 @@ class Ocapi(object):
 
 				# --- Simplified Trial Detection Logic ---
 				self.current_roi_brightness = self._calculate_roi_brightness(frame, img_h, img_w)
+				self.current_roi_difference = self._calculate_roi_difference(frame, img_h, img_w)
 
 				# 1. Collect baseline
 				if self.roi_baseline_mean is None:
+					if current_frame_time_ms < getattr(self, "ROI_BASELINE_START_TIME_MS", 30000):
+						continue  # Skip until start time to let calibration end
 					if len(self.roi_brightness_samples) < self.ROI_BRIGHTNESS_BASELINE_FRAMES:
 						self.roi_brightness_samples.append(self.current_roi_brightness)
+						if hasattr(self, 'current_roi_difference'):
+							self.roi_difference_samples.append(self.current_roi_difference)
 					else:
-						self.roi_baseline_mean = np.mean(self.roi_brightness_samples)
-						self.roi_baseline_std_dev = np.std(self.roi_brightness_samples)
-						if self.roi_baseline_std_dev < 0.5: self.roi_baseline_std_dev = 0.5
+						# Calculate baseline using 15th percentile to robustly find the background gray level
+						self.roi_baseline_mean = float(np.percentile(self.roi_brightness_samples, 15))
+						# (!!!) CRITICAL SAFETY: Fall back to safe default of 96.15 if calculated baseline is too high
+						if self.roi_baseline_mean > 102.0:
+							self.logger.warning(f"Calculated baseline mean ({self.roi_baseline_mean:.2f}) was too high (likely calibration active). Falling back to safe default of 96.15.")
+							self.roi_baseline_mean = 96.15
+						
+						# Calculate standard deviation on background frames (below median)
+						median_val = np.median(self.roi_brightness_samples)
+						bg_samples = [x for x in self.roi_brightness_samples if x <= median_val]
+						self.roi_baseline_std_dev = float(np.std(bg_samples)) if bg_samples else 0.5
+						if self.roi_baseline_std_dev < 0.5:
+							self.roi_baseline_std_dev = 0.5
+						
+						if self.roi_difference_samples:
+							self.roi_difference_baseline_mean = float(np.percentile(self.roi_difference_samples, 15))
+							if self.roi_difference_baseline_mean > 0.5:
+								self.roi_difference_baseline_mean = 0.1
+							median_diff = np.median(self.roi_difference_samples)
+							bg_diff_samples = [x for x in self.roi_difference_samples if x <= median_diff]
+							self.roi_difference_baseline_std = float(np.std(bg_diff_samples)) if bg_diff_samples else 0.02
+							if self.roi_difference_baseline_std < 0.02:
+								self.roi_difference_baseline_std = 0.02
+						else:
+							self.roi_difference_baseline_mean = 0.0
+							self.roi_difference_baseline_std = 0.02
+							
 						if self.PRINT_DATA:
 							self.logger.info(f"ROI Baseline Calculated: Mean={self.roi_baseline_mean:.2f}, SD={self.roi_baseline_std_dev:.2f}")
 					continue # Continue to next frame while collecting baseline
 
-				# 2. Detect stimulus (copied from _update_trial_state)
-				stimulus_detected = False
-				method = getattr(self, "TRIAL_ONSET_DETECTION_METHOD", "factor")
-				if method == "factor":
-					threshold = self.roi_baseline_mean * getattr(self, "ROI_BRIGHTNESS_THRESHOLD_FACTOR", 1.5)
-					if self.current_roi_brightness > threshold: stimulus_detected = True
-				elif method == "absolute":
-					threshold = getattr(self, "ROI_ABSOLUTE_BRIGHTNESS_THRESHOLD", 255)
-					if self.current_roi_brightness > threshold: stimulus_detected = True
-				elif method == "statistical":
-					# Get the statistical threshold (N * std_dev)
-					std_dev_multiplier = getattr(self, "ROI_BRIGHTNESS_STD_DEV_THRESHOLD", 5.0)
-					statistical_threshold = self.roi_baseline_mean + (std_dev_multiplier * self.roi_baseline_std_dev)
+				# 2. Feed frame to the trial state machine to detect and validate trial onset
+				self._update_trial_state(current_frame_time_ms)
+				self._end_active_trial_if_needed(current_frame_time_ms)
 
-					# Get the minimum factor threshold as a safety net
-					min_factor = getattr(self, "ROI_BRIGHTNESS_MIN_FACTOR", 1.0)  # Default to 1.0 (no effect)
-					factor_threshold = self.roi_baseline_mean * min_factor
-
-					# The final threshold is the greater of the two, ensuring robustness.
-					final_threshold = max(statistical_threshold, factor_threshold)
-
-					if self.current_roi_brightness > final_threshold:
-						stimulus_detected = True
-
-				# 3. If detected, we're done!
-				if stimulus_detected:
-					self.logger.info(f"--- First stimulus detected at frame {frame_count} ({current_frame_time_ms} ms) ---")
-					return frame_count, current_frame_time_ms
+				# 3. If a valid, non-discarded trial is finalized, we found our true first stimulus onset!
+				if self.all_trials_summary:
+					first_valid_trial = self.all_trials_summary[0]
+					first_valid_onset_ms = first_valid_trial['start_time_ms']
+					first_valid_frame = int(first_valid_onset_ms / (1000.0 / self.FPS))
+					self.logger.info(f"--- First valid stimulus detected at frame {first_valid_frame} ({first_valid_onset_ms} ms) ---")
+					return first_valid_frame, first_valid_onset_ms
 
 		finally:
 			# --- MODIFICATION ---
@@ -1606,13 +1623,36 @@ class Ocapi(object):
 	def _calculate_roi_brightness(self, frame, img_h, img_w):
 		x, y, w, h = self.STIMULUS_ROI_COORDS
 		x, y = max(0, x), max(0, y)
-		roi_x2, roi_y2 = min(img_w, x + w), min(img_h, y + h)
-		if roi_x2 > x and roi_y2 > y:
-			stimulus_roi = frame[y:roi_y2, x:roi_x2]
+		center_h = int(h * 0.80)
+		cy = y + int((h - center_h) / 2)
+		roi_x2, roi_y2 = min(img_w, x + w), min(img_h, cy + center_h)
+		if roi_x2 > x and roi_y2 > cy:
+			stimulus_roi = frame[cy:roi_y2, x:roi_x2]
 			gray_stimulus_roi = cv.cvtColor(stimulus_roi, cv.COLOR_BGR2GRAY)
 			return np.mean(gray_stimulus_roi)
 		if self.PRINT_DATA and self.frame_count % 100 == 0:
 			self.logger.warning(f"STIMULUS_ROI_COORDS {self.STIMULUS_ROI_COORDS} invalid for frame size ({img_w}x{img_h}).")
+		return 0.0
+
+	def _calculate_roi_difference(self, frame, img_h, img_w):
+		x, y, w, h = self.STIMULUS_ROI_COORDS
+		x, y = max(0, x), max(0, y)
+		center_h = int(h * 0.80)
+		cy = y + int((h - center_h) / 2)
+		roi_x2, roi_y2 = min(img_w, x + w), min(img_h, cy + center_h)
+		if roi_x2 > x and roi_y2 > cy:
+			stimulus_roi = frame[cy:roi_y2, x:roi_x2]
+			gray_stimulus_roi = cv.cvtColor(stimulus_roi, cv.COLOR_BGR2GRAY)
+			
+			# Downsample to 32x32 to filter out high-frequency compression/camera noise
+			resized = cv.resize(gray_stimulus_roi, (32, 32), interpolation=cv.INTER_AREA)
+			
+			if self.prev_gray_roi is None or self.prev_gray_roi.shape != resized.shape:
+				self.prev_gray_roi = resized
+				return 0.0
+			diff_frame = cv.absdiff(resized, self.prev_gray_roi)
+			self.prev_gray_roi = resized
+			return np.mean(diff_frame)
 		return 0.0
 
 	def _update_trial_state(self, current_frame_time_ms):
@@ -1621,57 +1661,93 @@ class Ocapi(object):
 		and finalizes trials when they end.
 		"""
 		# --- 1. Baseline Calculation ---
-		# If the baseline hasn't been calculated yet, collect brightness samples.
+		# If the baseline hasn't been calculated yet, collect brightness and difference samples.
 		if self.roi_baseline_mean is None:
+			if current_frame_time_ms < getattr(self, "ROI_BASELINE_START_TIME_MS", 30000):
+				return  # Skip until start time to let calibration end
 			# Only collect samples if a trial is not currently active.
 			if not (self.current_trial_data and self.current_trial_data['active']):
 				if len(self.roi_brightness_samples) < self.ROI_BRIGHTNESS_BASELINE_FRAMES:
 					self.roi_brightness_samples.append(self.current_roi_brightness)
+					if hasattr(self, 'current_roi_difference'):
+						self.roi_difference_samples.append(self.current_roi_difference)
 				# Once enough samples are collected, calculate the baseline statistics.
 				elif self.roi_brightness_samples:
-					self.roi_baseline_mean = np.mean(self.roi_brightness_samples)
-					self.roi_baseline_std_dev = np.std(self.roi_brightness_samples)
-					# A very low SD (e.g., from a solid black screen) can be problematic.
-					# Ensure it's at least a small value to prevent division by zero or hypersensitivity.
+					# Calculate baseline using 15th percentile to robustly find the background gray level
+					self.roi_baseline_mean = float(np.percentile(self.roi_brightness_samples, 15))
+					# (!!!) CRITICAL SAFETY: Fall back to safe default of 96.15 if calculated baseline is too high
+					if self.roi_baseline_mean > 102.0:
+						self.logger.warning(f"Calculated baseline mean ({self.roi_baseline_mean:.2f}) was too high (likely calibration active). Falling back to safe default of 96.15.")
+						self.roi_baseline_mean = 96.15
+					
+					# Calculate standard deviation on background frames (below median)
+					median_val = np.median(self.roi_brightness_samples)
+					bg_samples = [x for x in self.roi_brightness_samples if x <= median_val]
+					self.roi_baseline_std_dev = float(np.std(bg_samples)) if bg_samples else 0.5
 					if self.roi_baseline_std_dev < 0.5:
 						self.roi_baseline_std_dev = 0.5
+
+					if self.roi_difference_samples:
+						self.roi_difference_baseline_mean = float(np.percentile(self.roi_difference_samples, 15))
+						if self.roi_difference_baseline_mean > 0.5:
+							self.roi_difference_baseline_mean = 0.1
+						median_diff = np.median(self.roi_difference_samples)
+						bg_diff_samples = [x for x in self.roi_difference_samples if x <= median_diff]
+						self.roi_difference_baseline_std = float(np.std(bg_diff_samples)) if bg_diff_samples else 0.02
+						if self.roi_difference_baseline_std < 0.02:
+							self.roi_difference_baseline_std = 0.02
+					else:
+						self.roi_difference_baseline_mean = 0.0
+						self.roi_difference_baseline_std = 0.02
+
 					if self.PRINT_DATA:
 						self.logger.info(
-							f"ROI Baseline Calculated: Mean={self.roi_baseline_mean:.2f}, SD={self.roi_baseline_std_dev:.2f}")
+							f"ROI Baseline Calculated: Mean Brightness={self.roi_baseline_mean:.2f}, SD={self.roi_baseline_std_dev:.2f}")
+						if self.roi_difference_baseline_mean is not None:
+							self.logger.info(
+								f"ROI Difference Baseline: Mean={self.roi_difference_baseline_mean:.2f}, SD={self.roi_difference_baseline_std:.2f}")
 			else:
-				# If we are in a trial before baseline is set, do nothing.
-				pass
+				# If the baseline has been established and no trial is active,
+				# adapt the baseline mean to handle webcam auto-exposure drift.
+				if not (self.current_trial_data and self.current_trial_data['active']):
+					self.roi_baseline_mean = 0.98 * self.roi_baseline_mean + 0.02 * self.current_roi_brightness
 
-		# --- 2. Trial Onset Detection ---
+		# --- 2. Trial Onset Detection (Rolling average difference of means) ---
 		stimulus_detected = False
-		# Only try to detect a stimulus if the baseline has been established.
 		if self.roi_baseline_mean is not None:
-			method = getattr(self, "TRIAL_ONSET_DETECTION_METHOD", "factor")
+			# Initialize sliding history of ROI brightness
+			if not hasattr(self, 'roi_brightness_history'):
+				from collections import deque
+				self.roi_brightness_history = deque(maxlen=15)
+			
+			# Check if screen has gone dark to clear the wait-for-dark state
+			if self.current_roi_brightness <= self.roi_baseline_mean + 4.0:
+				self.waiting_for_dark = False
 
-			if method == "statistical":
-				# Get the statistical threshold (N * std_dev)
-				std_dev_multiplier = getattr(self, "ROI_BRIGHTNESS_STD_DEV_THRESHOLD", 5.0)
-				statistical_threshold = self.roi_baseline_mean + (std_dev_multiplier * self.roi_baseline_std_dev)
-
-				# Get the minimum factor threshold as a safety net
-				min_factor = getattr(self, "ROI_BRIGHTNESS_MIN_FACTOR", 1.0)  # Default to 1.0 (no effect)
-				factor_threshold = self.roi_baseline_mean * min_factor
-
-				# The final threshold is the greater of the two, ensuring robustness.
-				final_threshold = max(statistical_threshold, factor_threshold)
-
-				if self.current_roi_brightness > final_threshold:
+			# Update sliding history ONLY during stable background gray periods (non-bright screen, non-active trials)
+			# to prevent history from adapting to active stimulus levels or attention getters.
+			is_bright = (self.current_roi_brightness > self.roi_baseline_mean + 6.0)
+			trial_active = (self.current_trial_data and self.current_trial_data['active'])
+			if not (is_bright or trial_active):
+				self.roi_brightness_history.append(self.current_roi_brightness)
+			
+			# We need at least 15 frames to establish local background
+			if len(self.roi_brightness_history) == 15:
+				history_mean = np.mean(self.roi_brightness_history)
+				brightness_diff = self.current_roi_brightness - history_mean
+				
+				# Trigger onset if temporal difference rises above the statistical threshold
+				# (adjusted with a safety minimum of 1.5 to filter out residual background fluctuations)
+				std_dev_multiplier = getattr(self, "ROI_DIFF_STD_DEV_THRESHOLD", 8.0)
+				diff_mean = getattr(self, "roi_difference_baseline_mean", 0.0) or 0.0
+				diff_std = getattr(self, "roi_difference_baseline_std", 0.5) or 0.5
+				diff_threshold = diff_mean + (std_dev_multiplier * diff_std)
+				if diff_threshold < 0.7:
+					diff_threshold = 0.7
+				
+				if not getattr(self, 'waiting_for_dark', False) and self.current_roi_difference > diff_threshold:
 					stimulus_detected = True
-
-			elif method == "factor":
-				factor = getattr(self, "ROI_BRIGHTNESS_THRESHOLD_FACTOR", 1.5)
-				threshold = self.roi_baseline_mean * factor
-				if self.current_roi_brightness > threshold:
-					stimulus_detected = True
-			elif method == "absolute":
-				threshold = getattr(self, "ROI_ABSOLUTE_BRIGHTNESS_THRESHOLD", 255)
-				if self.current_roi_brightness > threshold:
-					stimulus_detected = True
+					self.current_trial_baseline_brightness = history_mean
 
 		# --- 3. Manage Trial State Machine ---
 		trial_can_start = (current_frame_time_ms >= self.last_trial_end_time_ms + self.MIN_INTER_TRIAL_INTERVAL_MS)
@@ -1686,6 +1762,7 @@ class Ocapi(object):
 			self.current_trial_data = {
 				'id': self.trial_counter, 'start_time_ms': start_t,
 				'stimulus_end_time_ms': stim_end_t, 'trial_end_time_ms': trial_end_t,
+				'baseline_brightness': getattr(self, 'current_trial_baseline_brightness', self.roi_baseline_mean),
 				'active': True, 'stimulus_frames_processed_gaze': 0,
 				'frames_on_stimulus_area': 0, 'looked_final': 1}
 			if self.PRINT_DATA:
@@ -1700,7 +1777,42 @@ class Ocapi(object):
 		This logic is now separate so it can be called for both EEG and video-triggered trials.
 		"""
 		if self.current_trial_data and self.current_trial_data['active']:
+			# Early Discard Check (Short Attention Getter / Glitch)
+			method = getattr(self, "TRIAL_ONSET_DETECTION_METHOD", "factor")
+			if method in ("temporal_difference", "statistical") and self.roi_baseline_mean is not None:
+				# Guard the first 150ms of onset rise time
+				if self.current_trial_data['start_time_ms'] + 150 <= current_frame_time_ms < self.current_trial_data['stimulus_end_time_ms']:
+					early_discard_multiplier = getattr(self, "ROI_EARLY_DISCARD_MULTIPLIER", 3.0)
+					brightness_threshold = self.roi_baseline_mean + early_discard_multiplier * self.roi_baseline_std_dev
+					if self.current_roi_brightness < brightness_threshold:
+						if self.PRINT_DATA:
+							self.logger.info(
+								f"Early discard Trial {self.current_trial_data['id']} - screen went dark before stimulus end. ROI Bright: {self.current_roi_brightness:.2f} < {brightness_threshold:.2f}")
+						self.trial_counter -= 1
+						self.current_trial_data = None
+						return
+
+
+			# End of trial check
 			if current_frame_time_ms >= self.current_trial_data['trial_end_time_ms']:
+				# Check if screen is still bright at the end of the trial (Attention Getter check)
+				if method in ("temporal_difference", "statistical") and self.roi_baseline_mean is not None:
+					local_baseline = self.current_trial_data.get('baseline_brightness', self.roi_baseline_mean)
+					if self.current_roi_brightness > local_baseline + 8.0:
+						self.current_trial_data['is_attention_getter'] = True
+						if self.PRINT_DATA:
+							self.logger.info(
+								f"Discarding Trial {self.current_trial_data['id']} - screen still bright at trial end (Attention Getter). ROI Bright: {self.current_roi_brightness:.2f} > {local_baseline + 8.0:.2f}")
+
+				if self.current_trial_data.get('is_attention_getter', False):
+					if self.PRINT_DATA:
+						self.logger.info(f"Trial {self.current_trial_data['id']} discarded (Attention Getter).")
+					self.trial_counter -= 1
+					self.waiting_for_dark = True  # Block subsequent triggers until screen goes dark
+					self.last_trial_end_time_ms = self.current_trial_data['trial_end_time_ms']
+					self.current_trial_data = None
+					return
+
 				if self.PRINT_DATA:
 					self.logger.info(
 						f"Trial {self.current_trial_data['id']} END @{current_frame_time_ms}ms (Part {self.current_video_part}).")
@@ -2444,9 +2556,13 @@ class Ocapi(object):
 			self.all_trials_summary = []
 			self.last_trial_end_time_ms = -self.MIN_INTER_TRIAL_INTERVAL_MS
 			self.roi_brightness_samples = []
+			self.roi_difference_samples = []
 			self.roi_baseline_mean = None
 			self.roi_baseline_std_dev = None
+			self.roi_difference_baseline_mean = None
+			self.roi_difference_baseline_std = None
 			self.last_trial_result_text = ""
+			self.prev_gray_roi = None
 
 	def _reset_for_main_pass(self):
 		"""
@@ -2468,7 +2584,13 @@ class Ocapi(object):
 			self.all_trials_summary = []
 			self.last_trial_end_time_ms = -self.MIN_INTER_TRIAL_INTERVAL_MS
 			self.roi_brightness_samples = []
+			self.roi_difference_samples = []
 			self.roi_baseline_mean = None
+			self.roi_difference_baseline_mean = None
+			self.prev_gray_roi = None
+			if hasattr(self, 'roi_brightness_history'):
+				self.roi_brightness_history.clear()
+			self.waiting_for_dark = False
 
 	def _execute_calibration_pass(self):
 		"""
@@ -2689,6 +2811,7 @@ class Ocapi(object):
 						self._check_for_eeg_trial_onset(current_frame_time_ms)
 					else:
 						self.current_roi_brightness = self._calculate_roi_brightness(frame, img_h, img_w)
+						self.current_roi_difference = self._calculate_roi_difference(frame, img_h, img_w)
 						self._update_trial_state(current_frame_time_ms)
 
 					# --- NEW: Centralized Trial Ending and Gaze Classification ---

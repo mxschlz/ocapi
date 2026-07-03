@@ -204,7 +204,7 @@ Trials:
     # Set this to just before you expect the first stimulus to appear.
     SEARCH_START_SECONDS: 300 # Example: Start search at 3 minutes
     # Duration (in seconds) at the start of the video to search for the active region.
-    SEARCH_DURATION_SECONDS: 10
+    SEARCH_DURATION_SECONDS: 30
     # How many rows and columns to divide the screen into for analysis.
     # More divisions are more precise but use more memory. [columns, rows]
     GRID_DIVISIONS: [30, 25]
@@ -212,11 +212,11 @@ Trials:
     # This is a percentage of the most active cell's variance.
     # Lower values (e.g., 25) create a larger, more inclusive ROI.
     # Higher values (e.g., 50) create a tighter, more focused ROI.
-    ACTIVITY_THRESHOLD_PERCENT: 50
+    ACTIVITY_THRESHOLD_PERCENT: 15
     # (Optional) You can provide a search area [x, y, w, h] to constrain the search
     # and prevent finding spurious activity in irrelevant parts of the screen.
     # If commented out, the whole screen is used.
-    SEARCH_AREA: [640, 720, 640, 360]
+    SEARCH_AREA: [1040, 300, 320, 450]
     MorphologicalCleaning:
       ENABLE_CLEANING: True
       # How many pixels to erode (remove noise). Range: 1-5.
@@ -233,24 +233,28 @@ Trials:
       # Padding to add, as a percentage of the detected ROI's width and height.
       # A value of 20 means the final ROI will be 20% wider and 20% taller.
       # This is generally more robust than using fixed pixel padding.
-      PADDING_PERCENTAGE: 0
+      PADDING_PERCENTAGE: 40
 
   # (Used if STIMULUS_ROI_METHOD is "static")
   # Defines the Region of Interest [x, y, width, height] on the video frame to monitor for a stimulus.
-  STIMULUS_ROI_COORDS: [820, 630, 300, 300]
-  # --- Trial Onset Detection Method ---
-  # Method for detecting the start of a trial based on ROI brightness.
-  # "statistical": (NEW & RECOMMENDED) Detects a trial if the brightness is a certain
-  #                number of standard deviations above the baseline mean. Most robust.
-  # "factor":      Detects a trial if brightness > (baseline_mean * factor). Good for high contrast.
-  # "absolute":    Detects a trial if brightness > absolute_value. Least robust.
-  TRIAL_ONSET_DETECTION_METHOD: "statistical"
+  STIMULUS_ROI_COORDS: [1060, 340, 280, 400]
+  TRIAL_ONSET_DETECTION_METHOD: "temporal_difference"
+
+  # -- Parameters for "temporal_difference" method --
+  TemporalDifference:
+    # A trial is detected if ROI pixel difference > (baseline_mean + N * baseline_std_dev).
+    # Higher is less sensitive. Default is 8.0.
+    ROI_DIFF_STD_DEV_THRESHOLD: 8.0
+    # Brightness threshold multiplier above baseline to qualify a trial and detect attention getters.
+    ROI_BRIGHTNESS_THRESHOLD_MULTIPLIER: 15.0
+    # Brightness threshold multiplier above baseline to detect attention getters.
+    ROI_ATTENTION_GETTER_MULTIPLIER: 20.0
 
   # -- Parameters for "statistical" method --
   Statistical:
     # A trial is detected if ROI brightness > (baseline_mean + N * baseline_std_dev).
     # A value of 3-5 is a good starting point. Higher is less sensitive.
-    ROI_BRIGHTNESS_STD_DEV_THRESHOLD: 1.0
+    ROI_BRIGHTNESS_STD_DEV_THRESHOLD: 15.0
 
     # (NEW & RECOMMENDED) To prevent false positives on very dark/stable baselines, this
     # adds a minimum factor. The final threshold will be the HIGHER of the statistical
@@ -268,8 +272,11 @@ Trials:
     # Use a fixed brightness threshold (0-255).
     ROI_ABSOLUTE_BRIGHTNESS_THRESHOLD: 180
 
+  # Time in milliseconds into the video to wait before starting baseline collection (bypasses calibration phase).
+  ROI_BASELINE_START_TIME_MS: 30000
+
   # Number of initial non-trial frames used to establish a baseline "dark" screen brightness.
-  ROI_BRIGHTNESS_BASELINE_FRAMES: 5
+  ROI_BRIGHTNESS_BASELINE_FRAMES: 150
 
   # --- Trial Timing ---
   # How long the stimulus is considered "on" after initial detection.
