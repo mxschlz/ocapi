@@ -102,99 +102,262 @@ class MediaPipeDetector:
 class DeepLabCutDetector:
     """
     Detector using a custom trained DeepLabCut model.
-    Requires 'dlclive' to be installed and 'DLC_MODEL_PATH' in config.
+    Can load pre-extracted filtered CSV files if available for the video,
+    or falls back to live DLCLive model inference.
     """
     def __init__(self, config):
-        try:
-            import dlclive
-            from dlclive import DLCLive, Processor
-        except ImportError:
-            raise ImportError("DeepLabCut Live is not installed. Please run: pip install dlclive")
-
         self.config = config
-        model_path = getattr(config, "DLC_MODEL_PATH", None)
-        if not model_path:
-            raise ValueError("DLC_MODEL_PATH not set in config.yaml")
-
-        # Sanitize model_path in case user copied python raw string syntax (r"...") into YAML
-        if isinstance(model_path, str):
-            model_path = model_path.strip()
-            # Remove r"..." or r'...' wrappers
-            if (model_path.startswith('r"') and model_path.endswith('"')) or \
-               (model_path.startswith("r'") and model_path.endswith("'")):
-                model_path = model_path[2:-1]
-            # Remove "..." or '...' wrappers if present without r
-            elif (model_path.startswith('"') and model_path.endswith('"')) or \
-                 (model_path.startswith("'") and model_path.endswith("'")):
-                model_path = model_path[1:-1]
-
-        # Load the label mapping from config.yml
         self.mapping = getattr(config, "DLC_LABEL_MAPPING", {})
+        self.use_csv = False
+        self.pose_data = {}
+        self.csv_part_cols = {}
+        
+        # Check if we can find a pre-extracted CSV file for the video input
+        video_path = getattr(config, "VIDEO_INPUT", None)
+        if video_path:
+            import glob
+            from ocapi import get_data_path
+            
+            video_dir = os.path.dirname(video_path)
+            video_stem = os.path.splitext(os.path.basename(video_path))[0]
+            
+            # List of places to look for the CSV file
+            csv_candidates = []
+            
+            # 1. In the same directory as the video file (prioritizing filtered)
+            csv_candidates.extend(glob.glob(os.path.join(video_dir, f"{video_stem}*filtered.csv")))
+            csv_candidates.extend([c for c in glob.glob(os.path.join(video_dir, f"{video_stem}*.csv")) if not c.endswith("processed.csv") and c not in csv_candidates])
+            
+            # 2. In the all_videos_combined directory
+            try:
+                combined_dir = os.path.join(get_data_path(), "all_videos_combined")
+                csv_candidates.extend(glob.glob(os.path.join(combined_dir, f"{video_stem}*filtered.csv")))
+                csv_candidates.extend([c for c in glob.glob(os.path.join(combined_dir, f"{video_stem}*.csv")) if not c.endswith("processed.csv") and c not in csv_candidates])
+            except Exception:
+                pass
+                
+            if csv_candidates:
+                csv_file_path = csv_candidates[0]
+                if getattr(config, "PRINT_DATA", True):
+                    print(f"DEBUG: Found pre-extracted DeepLabCut CSV file: '{csv_file_path}'")
+                
+                try:
+                    with open(csv_file_path, mode='r') as f:
+                        reader = csv.reader(f)
+                        row_scorer = next(reader)
+                        row_parts = next(reader)
+                        row_coords = next(reader)
+                        
+                        # Map body part name in CSV to its column indices
+                        for idx in range(1, len(row_parts)):
+                            part = row_parts[idx].strip()
+                            coord = row_coords[idx].strip()
+                            if not part:
+                                continue
+                            if part not in self.csv_part_cols:
+                                self.csv_part_cols[part] = {}
+                            self.csv_part_cols[part][coord] = idx
+                        
+                        required_keys = [
+                            'left_iris_center', 'right_iris_center',
+                            'left_eye_outer_corner', 'right_eye_outer_corner',
+                            'nose_tip', 'chin',
+                            'left_mouth_corner', 'right_mouth_corner'
+                        ]
+                        
+                        # Read and parse coordinates to simple float tuples directly
+                        for row in reader:
+                            if not row or not row[0]:
+                                continue
+                            try:
+                                frame_idx = int(row[0])
+                            except ValueError:
+                                continue
+                            
+                            landmarks_data = {}
+                            for key in required_keys:
+                                dlc_label = self.mapping.get(key)
+                                part_cols = None
+                                if dlc_label and dlc_label in self.csv_part_cols:
+                                    part_cols = self.csv_part_cols[dlc_label]
+                                elif key in self.csv_part_cols:
+                                    part_cols = self.csv_part_cols[key]
+                                    
+                                if not part_cols or 'x' not in part_cols or 'y' not in part_cols or 'likelihood' not in part_cols:
+                                    continue
+                                    
+                                try:
+                                    x_val = float(row[part_cols['x']])
+                                    y_val = float(row[part_cols['y']])
+                                    lh_val = float(row[part_cols['likelihood']])
+                                    
+                                    if lh_val >= self.config.MIN_DETECTION_CONFIDENCE:
+                                        landmarks_data[key] = (x_val, y_val)
+                                except (IndexError, ValueError):
+                                    continue
+                            
+                            if landmarks_data:
+                                self.pose_data[frame_idx] = landmarks_data
+                                
+                    self.use_csv = True
+                    if getattr(config, "PRINT_DATA", True):
+                        print(f"DEBUG: Successfully loaded and parsed {len(self.pose_data)} frames of pose data from CSV.")
+                except Exception as e:
+                    if getattr(config, "PRINT_DATA", True):
+                        print(f"WARNING: Failed to load CSV file '{csv_file_path}': {e}. Falling back to DLCLive.")
 
-        try:
-            if getattr(config, "PRINT_DATA", True):
-                print(f"DEBUG: Initializing DLCLive with model path: '{model_path}'")
+        if not self.use_csv:
+            try:
+                import dlclive
+                from dlclive import DLCLive, Processor
+            except ImportError:
+                raise ImportError("DeepLabCut Live is not installed and no matching pre-extracted CSV was found. Please run: pip install dlclive")
 
-            # The simple, robust way that matches the working demo script.
-            # DLCLive is smart enough to determine the model type from the directory contents.
-            # Forcing a model_type can cause issues if the path is a directory.
-            self.dlc_proc = DLCLive(model_path)
+            model_path = getattr(config, "DLC_MODEL_PATH", None)
+            if not model_path:
+                raise ValueError("DLC_MODEL_PATH not set in config.yaml and no matching pre-extracted CSV was found.")
 
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize DLCLive with path: {model_path}\nError: {e}")
+            # Sanitize model_path in case user copied python raw string syntax (r"...") into YAML
+            if isinstance(model_path, str):
+                model_path = model_path.strip()
+                # Remove r"..." or r'...' wrappers
+                if (model_path.startswith('r"') and model_path.endswith('"')) or \
+                   (model_path.startswith("r'") and model_path.endswith("'")):
+                    model_path = model_path[2:-1]
+                # Remove "..." or '...' wrappers if present without r
+                elif (model_path.startswith('"') and model_path.endswith('"')) or \
+                     (model_path.startswith("'") and model_path.endswith("'")):
+                    model_path = model_path[1:-1]
 
-        # Extract body part names from the loaded configuration within DLCLive
-        # Newer DLCLive versions loading .pt files store config internally
-        if hasattr(self.dlc_proc, 'pose_cfg') and self.dlc_proc.pose_cfg:
-            self.body_parts = self.dlc_proc.pose_cfg.get('all_joints_names', [])
-        else:
-            # Fallback: try to find pose_cfg.yaml manually if DLCLive didn't expose it
-            search_dir = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
-            pose_cfg_path = os.path.join(search_dir, "pose_cfg.yaml")
-            if os.path.exists(pose_cfg_path):
-                with open(pose_cfg_path, 'r') as f:
-                    self.body_parts = yaml.safe_load(f).get('all_joints_names', [])
+            try:
+                if getattr(config, "PRINT_DATA", True):
+                    print(f"DEBUG: Initializing DLCLive with model path: '{model_path}'")
+                self.dlc_proc = DLCLive(model_path)
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize DLCLive with path: {model_path}\nError: {e}")
+
+            # Extract body part names from the loaded configuration within DLCLive
+            if hasattr(self.dlc_proc, 'pose_cfg') and self.dlc_proc.pose_cfg:
+                self.body_parts = self.dlc_proc.pose_cfg.get('all_joints_names', [])
             else:
-                raise ValueError(f"Could not determine body parts. DLCLive object has no 'pose_cfg' and 'pose_cfg.yaml' not found in {search_dir}")
+                search_dir = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
+                pose_cfg_path = os.path.join(search_dir, "pose_cfg.yaml")
+                if os.path.exists(pose_cfg_path):
+                    with open(pose_cfg_path, 'r') as f:
+                        self.body_parts = yaml.safe_load(f).get('all_joints_names', [])
+                else:
+                    raise ValueError(f"Could not determine body parts. DLCLive object has no 'pose_cfg' and 'pose_cfg.yaml' not found in {search_dir}")
 
-        # Initialize inference (warmup) with a dummy image
-        # DLC expects height, width, channels
-        self.dlc_proc.init_inference(np.zeros((int(config.cap.get(cv.CAP_PROP_FRAME_HEIGHT)),
-                                               int(config.cap.get(cv.CAP_PROP_FRAME_WIDTH)), 3), dtype=np.uint8))
+            # Initialize inference (warmup) with a dummy image
+            self.dlc_proc.init_inference(np.zeros((int(config.cap.get(cv.CAP_PROP_FRAME_HEIGHT)),
+                                                   int(config.cap.get(cv.CAP_PROP_FRAME_WIDTH)), 3), dtype=np.uint8))
 
     def detect(self, frame) -> Optional[FaceLandmarks]:
-        # DLC Live returns a pose object. The structure depends on your export settings.
-        # Usually it is a numpy array of shape (N, 3) -> [x, y, likelihood]
-        pose = self.dlc_proc.get_pose(frame)
-
-        landmarks_data = {}
-        required_keys = [
-            'left_iris_center', 'right_iris_center',
-            'left_eye_outer_corner', 'right_eye_outer_corner',
-            'nose_tip', 'chin',
-            'left_mouth_corner', 'right_mouth_corner'
-        ]
-
-        for key in required_keys:
-            dlc_label = self.mapping.get(key)
-
-            # If label is not mapped or not found in model, we cannot form a complete face
-            if not dlc_label or dlc_label not in self.body_parts:
-                # You might want to log a warning here once
-                return None
-
-            idx = self.body_parts.index(dlc_label)
-
-            # Check confidence
-            confidence = pose[idx][2]
-            if confidence >= self.config.MIN_DETECTION_CONFIDENCE:
-                landmarks_data[key] = pose[idx][:2] # Store [x, y]
-
-        # If we have no data at all, return None
-        if not landmarks_data:
-            return None
+        if self.use_csv:
+            frame_idx = getattr(self.config, "frame_count", 0)
             
-        return FaceLandmarks(**landmarks_data)
+            # Fallback check
+            if frame_idx not in self.pose_data:
+                cap_idx = int(self.config.cap.get(cv.CAP_PROP_POS_FRAMES)) - 1
+                if cap_idx in self.pose_data:
+                    frame_idx = cap_idx
+            
+            landmarks_data = self.pose_data.get(frame_idx)
+            if not landmarks_data:
+                return None
+                
+            mp_indices = {
+                'nose_tip': 4,
+                'chin': 152,
+                'left_eye_outer_corner': 263,
+                'right_eye_outer_corner': 33,
+                'left_mouth_corner': 291,
+                'right_mouth_corner': 61,
+            }
+            
+            mesh_points = np.zeros((478, 2), dtype=np.int32)
+            for key, idx in mp_indices.items():
+                if key in landmarks_data:
+                    mesh_points[idx] = np.array(landmarks_data[key], dtype=np.int32)
+                    
+            if 'left_iris_center' in landmarks_data:
+                mesh_points[474] = np.array(landmarks_data['left_iris_center'], dtype=np.int32)
+            if 'right_iris_center' in landmarks_data:
+                mesh_points[469] = np.array(landmarks_data['right_iris_center'], dtype=np.int32)
+                
+            return FaceLandmarks(
+                left_iris_center=np.array(landmarks_data['left_iris_center']) if 'left_iris_center' in landmarks_data else None,
+                right_iris_center=np.array(landmarks_data['right_iris_center']) if 'right_iris_center' in landmarks_data else None,
+                left_eye_outer_corner=np.array(landmarks_data['left_eye_outer_corner']) if 'left_eye_outer_corner' in landmarks_data else None,
+                right_eye_outer_corner=np.array(landmarks_data['right_eye_outer_corner']) if 'right_eye_outer_corner' in landmarks_data else None,
+                nose_tip=np.array(landmarks_data['nose_tip']) if 'nose_tip' in landmarks_data else None,
+                chin=np.array(landmarks_data['chin']) if 'chin' in landmarks_data else None,
+                left_mouth_corner=np.array(landmarks_data['left_mouth_corner']) if 'left_mouth_corner' in landmarks_data else None,
+                right_mouth_corner=np.array(landmarks_data['right_mouth_corner']) if 'right_mouth_corner' in landmarks_data else None,
+                raw_mesh_points_2d=mesh_points,
+                raw_mesh_points_3d=None,
+                mp_multi_face_landmarks=None
+            )
+        else:
+            # Fallback to live model inference
+            pose = self.dlc_proc.get_pose(frame)
+
+            landmarks_data = {}
+            required_keys = [
+                'left_iris_center', 'right_iris_center',
+                'left_eye_outer_corner', 'right_eye_outer_corner',
+                'nose_tip', 'chin',
+                'left_mouth_corner', 'right_mouth_corner'
+            ]
+
+            for key in required_keys:
+                dlc_label = self.mapping.get(key)
+
+                if not dlc_label or dlc_label not in self.body_parts:
+                    return None
+
+                idx = self.body_parts.index(dlc_label)
+
+                confidence = pose[idx][2]
+                if confidence >= self.config.MIN_DETECTION_CONFIDENCE:
+                    landmarks_data[key] = pose[idx][:2]
+
+            if not landmarks_data:
+                return None
+                
+            mesh_points = np.zeros((478, 2), dtype=np.int32)
+            
+            mp_indices = {
+                'nose_tip': 4,
+                'chin': 152,
+                'left_eye_outer_corner': 263,
+                'right_eye_outer_corner': 33,
+                'left_mouth_corner': 291,
+                'right_mouth_corner': 61,
+            }
+            
+            for key, idx in mp_indices.items():
+                if key in landmarks_data:
+                    mesh_points[idx] = landmarks_data[key].astype(np.int32)
+                    
+            if 'left_iris_center' in landmarks_data:
+                mesh_points[474] = landmarks_data['left_iris_center'].astype(np.int32)
+            if 'right_iris_center' in landmarks_data:
+                mesh_points[469] = landmarks_data['right_iris_center'].astype(np.int32)
+
+            return FaceLandmarks(
+                left_iris_center=landmarks_data.get('left_iris_center'),
+                right_iris_center=landmarks_data.get('right_iris_center'),
+                left_eye_outer_corner=landmarks_data.get('left_eye_outer_corner'),
+                right_eye_outer_corner=landmarks_data.get('right_eye_outer_corner'),
+                nose_tip=landmarks_data.get('nose_tip'),
+                chin=landmarks_data.get('chin'),
+                left_mouth_corner=landmarks_data.get('left_mouth_corner'),
+                right_mouth_corner=landmarks_data.get('right_mouth_corner'),
+                raw_mesh_points_2d=mesh_points,
+                raw_mesh_points_3d=None,
+                mp_multi_face_landmarks=None
+            )
 
 class Ocapi(object):
 	def __init__(self, subject_id=None, config_file_path="config.yaml", VIDEO_INPUT=None, VIDEO_OUTPUT=None, WEBCAM=0,
@@ -264,11 +427,19 @@ class Ocapi(object):
 		self._indices_pose = getattr(self, "_indices_pose", [4, 152, 263, 33, 291, 61])
 
 		# 4. Initialize hardware and models
-		self.cap = self.init_video_input()
-		self.FPS = self.cap.get(cv.CAP_PROP_FPS)
-		if self.FPS == 0:
-			self.logger.warning("Video FPS reported as 0. Defaulting to 30 FPS for calculations.")
-			self.FPS = 30.0
+		try:
+			self.cap = self.init_video_input()
+			self.FPS = self.cap.get(cv.CAP_PROP_FPS)
+			if self.FPS == 0:
+				self.logger.warning("Video FPS reported as 0. Defaulting to 30 FPS for calculations.")
+				self.FPS = 30.0
+			if not getattr(self, "total_frames", 0):
+				if self.cap and self.cap.isOpened():
+					self.total_frames = int(self.cap.get(cv.CAP_PROP_FRAME_COUNT))
+		except Exception as e:
+			self.logger.warning(f"Could not initialize video capture: {e}. If pre-extracted CSV is available, analysis can still run.")
+			self.cap = None
+			self.FPS = 60.0
 		
 		detector_type = getattr(self, "DETECTOR_TYPE", "mediapipe")
 		if detector_type.lower() == "deeplabcut":
@@ -277,9 +448,47 @@ class Ocapi(object):
 			self.detector = MediaPipeDetector(self)
 		self.socket = self.init_socket()
 
+		self.in_dynamic_roi_search = False
+		self.in_stimulus_onset_search = False
+
+		# If skip_video_decoding is enabled, verify we have CSV data.
+		self.skip_video_decoding = getattr(self, "SKIP_VIDEO_DECODING", True)
+		if self.skip_video_decoding:
+			if getattr(self.detector, 'use_csv', False):
+				self.SHOW_ON_SCREEN_DATA = False
+				self.logger.info("  -> SKIP_VIDEO_DECODING enabled and pre-extracted CSV data found. Frame decoding is bypassed.")
+				# Determine total frames from CSV if self.cap is not open/available
+				if not self.cap or not self.cap.isOpened():
+					self.total_frames = max(self.detector.pose_data.keys()) + 1 if self.detector.pose_data else 0
+			else:
+				self.skip_video_decoding = False
+				self.logger.warning("  -> SKIP_VIDEO_DECODING was enabled, but no matching pre-extracted DeepLabCut CSV file was found. Falling back to video decoding.")
+
 		# 5. Initialize state variables
 		self.initial_pitch, self.initial_yaw, self.initial_roll = None, None, None
 		self.calibrated = False
+		self.use_ml_classifier = (getattr(self, "GAZE_CLASSIFICATION_METHOD", "eye_gaze_with_head_filter") == "ml_classifier")
+		self.ml_model = None
+		self.ml_scaler = None
+		if self.use_ml_classifier:
+			import pickle
+			model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gaze_classifier_gb.pkl")
+			if os.path.exists(model_path):
+				self.logger.info(f"Loading production gaze classifier ML model from {model_path}...")
+				with open(model_path, "rb") as f:
+					data = pickle.load(f)
+					self.ml_model = data["classifier"]
+					self.ml_scaler = data["scaler"]
+				self.logger.info("ML model and scaler loaded successfully.")
+			else:
+				self.logger.error(f"ML model file not found at {model_path}! Falling back to eye_gaze_with_head_filter.")
+				self.use_ml_classifier = False
+				self.GAZE_CLASSIFICATION_METHOD = "eye_gaze_with_head_filter"
+		
+		self.eye_l_dx_baseline = 0.0
+		self.eye_r_dx_baseline = 0.0
+		self.eye_l_dy_baseline = 0.0
+		self.eye_r_dy_baseline = 0.0
 		self.TOTAL_BLINKS = 0
 		self.EYES_BLINK_FRAME_COUNTER = 0
 		self.csv_data = []
@@ -291,12 +500,23 @@ class Ocapi(object):
 
 		# 6. Setup Calibration
 		self.CALIBRATION_METHOD = getattr(self, "METHOD", "manual")
-		self.auto_calibrate_pending = self.CALIBRATION_METHOD in ["clustering", "gaze_informed"]
+		if self.CALIBRATION_METHOD == "none":
+			self.calibrated = True
+			self.initial_pitch, self.initial_yaw, self.initial_roll = 0.0, 0.0, 0.0
+			self.auto_calibrate_pending = False
+		else:
+			self.auto_calibrate_pending = self.CALIBRATION_METHOD in ["clustering", "gaze_informed"]
 		self.calib_duration_sec = getattr(self, "CLUSTERING_CALIB_DURATION_SECONDS", 30)
 		self.CLUSTERING_CALIB_DURATION_FRAMES = int(self.calib_duration_sec * self.FPS)
 		self.clustering_calib_all_samples = []
 		self.head_pose_calibration_samples = {'pitch': [], 'yaw': [], 'roll': []}
 		self.head_pose_calibration_frame_counter = 0
+
+		# Gaze Informed calibration config mapping / fallback
+		self.HEAD_POSE_AUTO_CALIB_EYE_DX_RANGE = getattr(self, "EYE_DX_RANGE", [-20, 20])
+		self.HEAD_POSE_AUTO_CALIB_EYE_DY_RANGE = getattr(self, "EYE_DY_RANGE", [-20, 20])
+		self.HEAD_POSE_AUTO_CALIB_MIN_SAMPLES = getattr(self, "MIN_SAMPLES", 30)
+		self.HEAD_POSE_AUTO_CALIB_DURATION_FRAMES = self.CLUSTERING_CALIB_DURATION_FRAMES
 
 		# 7. Setup Trial Detection
 		self.ENABLE_VIDEO_TRIAL_DETECTION = getattr(self, "ENABLE", False)
@@ -309,8 +529,10 @@ class Ocapi(object):
 			self.roi_baseline_mean = None
 			self.roi_baseline_std_dev = None
 			self.last_trial_result_text = ""
-			# Load the new gaze threshold parameter with a safe default
+			# Load the new gaze threshold and head compensation parameters with safe defaults
 			self.GAZE_DX_SUM_THRESHOLD = getattr(self, "GAZE_DX_SUM_THRESHOLD", 999)
+			self.EYE_HEAD_COMPENSATION_BETA = getattr(self, "EYE_HEAD_COMPENSATION_BETA", 0.0)
+			self._load_subject_specific_parameters()
 			self._validate_trial_detection_config()
 
 		# 8. Initialize video output for the first part
@@ -393,7 +615,7 @@ class Ocapi(object):
 
 	def _setup_column_names(self):
 		self.column_names = [
-			"Timestamp (ms)", "Frame Nr",
+			"Timestamp (ms)", "Frame Nr", "Trial ID",
 			"Left Eye Center X", "Left Eye Center Y",
 			"Right Eye Center X", "Right Eye Center Y",
 			"Left Iris Relative Pos Dx", "Left Iris Relative Pos Dy",
@@ -409,6 +631,75 @@ class Ocapi(object):
 				+ [f"Landmark_{i}_Y" for i in range(num_landmarks)]
 				+ ([f"Landmark_{i}_Z" for i in range(num_landmarks)] if self.LOG_Z_COORD else [])
 			)
+
+	def _load_subject_specific_parameters(self):
+		"""
+		Checks if subject-specific optimized parameters exist in batch_optimization_summary.csv
+		and overrides the loaded config parameters with them to ensure the best pose coding quality.
+		"""
+		if not self.subject_id:
+			return
+
+		# Construct the combined subject_session string (e.g. "SCS048_A")
+		subject_key = self.subject_id
+		if self.session:
+			subject_key = f"{self.subject_id}_{self.session}"
+
+		# Search for batch_optimization_summary.csv in common directories
+		possible_paths = [
+			"batch_optimization_summary.csv",
+			os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "batch_optimization_summary.csv"),
+			os.path.join(os.path.dirname(os.path.abspath(__file__)), "batch_optimization_summary.csv")
+		]
+
+		csv_path = None
+		for path in possible_paths:
+			if os.path.exists(path):
+				csv_path = path
+				break
+
+		if not csv_path:
+			if self.PRINT_DATA:
+				self.logger.info("Subject-specific optimization file not found. Using default parameters.")
+			return
+
+		try:
+			import pandas as pd
+			df = pd.read_csv(csv_path)
+			# Find the row for this subject key
+			row = df[df['subject'] == subject_key]
+			if not row.empty:
+				if self.PRINT_DATA:
+					self.logger.info(f"--- Loading optimal parameters for subject {subject_key} from {csv_path} ---")
+				
+				# Load the parameters
+				yaw_shift = float(row.iloc[0]['yaw_shift'])
+				pitch_shift = float(row.iloc[0]['pitch_shift'])
+				yaw_range = float(row.iloc[0]['yaw_range'])
+				pitch_range = float(row.iloc[0]['pitch_range'])
+				threshold_percent = float(row.iloc[0]['threshold_percent'])
+				use_first_frame = bool(row.iloc[0]['use_first_frame'])
+
+				# Override the attributes
+				self.CALIBRATION_YAW_SHIFT = yaw_shift + 4.0
+				self.CALIBRATION_PITCH_SHIFT = pitch_shift + 16.0
+				self.STIMULUS_YAW_RANGE = [-yaw_range, yaw_range]
+				self.STIMULUS_PITCH_RANGE = [-pitch_range, pitch_range]
+				self.LOOK_TO_STIMULUS_THRESHOLD_PERCENT = threshold_percent
+				self.USE_FIRST_FRAME_ONLY_FOR_GAZE = use_first_frame
+
+				if self.PRINT_DATA:
+					self.logger.info(f"  CALIBRATION_YAW_SHIFT: {self.CALIBRATION_YAW_SHIFT}")
+					self.logger.info(f"  CALIBRATION_PITCH_SHIFT: {self.CALIBRATION_PITCH_SHIFT}")
+					self.logger.info(f"  STIMULUS_YAW_RANGE: {self.STIMULUS_YAW_RANGE}")
+					self.logger.info(f"  STIMULUS_PITCH_RANGE: {self.STIMULUS_PITCH_RANGE}")
+					self.logger.info(f"  LOOK_TO_STIMULUS_THRESHOLD_PERCENT: {self.LOOK_TO_STIMULUS_THRESHOLD_PERCENT}")
+					self.logger.info(f"  USE_FIRST_FRAME_ONLY_FOR_GAZE: {self.USE_FIRST_FRAME_ONLY_FOR_GAZE}")
+			else:
+				if self.PRINT_DATA:
+					self.logger.info(f"No optimized parameters found for subject {subject_key} in {csv_path}. Using default parameters.")
+		except Exception as e:
+			self.logger.warning(f"Error loading subject-specific parameters: {e}")
 
 	def _validate_trial_detection_config(self):
 		"""
@@ -730,6 +1021,7 @@ class Ocapi(object):
 		return cap
 
 	def init_video_output(self, part_suffix=""):
+		if getattr(self, 'skip_video_decoding', False): return None
 		if not self.VIDEO_OUTPUT_BASE: return None  # Use VIDEO_OUTPUT_BASE
 
 		base, ext = os.path.splitext(self.VIDEO_OUTPUT_BASE)
@@ -780,8 +1072,10 @@ class Ocapi(object):
 		brightness variance, which is assumed to be the stimulus ROI. This is a pre-analysis pass.
 		Returns True on success, False on failure.
 		"""
+		self.in_dynamic_roi_search = True
 		if not self.cap or not self.cap.isOpened():
 			self.logger.error("Video capture not open for dynamic ROI detection.")
+			self.in_dynamic_roi_search = False
 			return False
 
 		# --- 1. Get parameters from config ---
@@ -948,9 +1242,50 @@ class Ocapi(object):
 		# IMPORTANT: Reset the video capture for the next pass
 		self.cap.release()
 		self.cap = self.init_video_input()
+		self.in_dynamic_roi_search = False
 		return True
 
+	@property
+	def requires_frame_pixels(self):
+		if getattr(self, 'skip_video_decoding', False):
+			if getattr(self, 'in_calibration_pass', False):
+				return False
+			if getattr(self, 'in_dynamic_roi_search', False) or getattr(self, 'in_stimulus_onset_search', False):
+				return True
+			return False
+		# 0. During calibration pass, we do not need frame pixels if use_csv is True.
+		if getattr(self, 'in_calibration_pass', False):
+			return False
+		# 1. We are not using pre-extracted CSV data for pose.
+		if not getattr(self.detector, 'use_csv', False):
+			return True
+		# 2. We need to display the video on screen.
+		if self.SHOW_ON_SCREEN_DATA:
+			return True
+		# 3. We are saving the output video.
+		if self.out is not None and self.out.isOpened():
+			return True
+		# 4. We are performing video-based trial detection and don't have EEG marker file trial onsets.
+		if self.ENABLE_VIDEO_TRIAL_DETECTION and not self.eeg_trial_onsets_ms:
+			return True
+		# 5. We are using dynamic ROI search.
+		if getattr(self, 'STIMULUS_ROI_METHOD', 'static') == 'dynamic':
+			return True
+		return False
+
 	def _get_and_preprocess_frame(self):
+		if not self.requires_frame_pixels:
+			limit = self.total_frames if self.total_frames > 0 else 9999999
+			if getattr(self, 'frame_count', 0) >= limit:
+				return None, 0, 0, False
+			
+			if not hasattr(self, '_img_w_cached') or not hasattr(self, '_img_h_cached'):
+				self._img_w_cached = int(self.cap.get(cv.CAP_PROP_FRAME_WIDTH))
+				self._img_h_cached = int(self.cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+				if self.ROTATE in [90, -90, 270]:
+					self._img_w_cached, self._img_h_cached = self._img_h_cached, self._img_w_cached
+			return None, self._img_h_cached, self._img_w_cached, True
+
 		ret, frame = self.cap.read()
 		if not ret:
 			return None, 0, 0, False
@@ -980,11 +1315,34 @@ class Ocapi(object):
 			outer_left_corner = landmarks.left_eye_outer_corner
 			outer_right_corner = landmarks.right_eye_outer_corner
 			
-			self.l_dx, self.l_dy = self.vector_position(outer_left_corner, center_left)
-			self.r_dx, self.r_dy = self.vector_position(outer_right_corner, center_right)
+			l_dx_raw, l_dy_raw = self.vector_position(outer_left_corner, center_left)
+			r_dx_raw, r_dy_raw = self.vector_position(outer_right_corner, center_right)
+			
+			# Dynamic scale normalization (IOD-based scale normalization)
+			iod = np.linalg.norm(outer_left_corner.ravel() - outer_right_corner.ravel())
+			if iod > 10.0:
+				scale_factor = 100.0 / iod
+			else:
+				scale_factor = 1.0
+
+			self.scale_factor = scale_factor
+			self.iod = iod
+			
+			# Subtract baselines if calibration is enabled
+			l_dx_baseline = getattr(self, 'eye_l_dx_baseline', 0.0)
+			r_dx_baseline = getattr(self, 'eye_r_dx_baseline', 0.0)
+			l_dy_baseline = getattr(self, 'eye_l_dy_baseline', 0.0)
+			r_dy_baseline = getattr(self, 'eye_r_dy_baseline', 0.0)
+			
+			self.l_dx = (l_dx_raw * scale_factor) - l_dx_baseline
+			self.l_dy = (l_dy_raw * scale_factor) - l_dy_baseline
+			self.r_dx = (r_dx_raw * scale_factor) - r_dx_baseline
+			self.r_dy = (r_dy_raw * scale_factor) - r_dy_baseline
 		except Exception:
 			self.l_cx, self.l_cy, self.r_cx, self.r_cy = 0, 0, 0, 0
 			self.l_dx, self.l_dy, self.r_dx, self.r_dy = 0.0, 0.0, 0.0, 0.0
+			self.scale_factor = 1.0
+			self.iod = 0.0
 
 	def _check_downward_look(self):
 		if hasattr(self, 'DOWNWARD_LOOK_LEFT_IRIS_DY_MIN') and hasattr(self, 'DOWNWARD_LOOK_RIGHT_IRIS_DY_MIN'):
@@ -1053,10 +1411,10 @@ class Ocapi(object):
 				if self.head_pose_calibration_frame_counter >= self.HEAD_POSE_AUTO_CALIB_DURATION_FRAMES:
 					# Ensure we have enough high-quality samples
 					if len(self.head_pose_calibration_samples['pitch']) >= self.HEAD_POSE_AUTO_CALIB_MIN_SAMPLES:
-						# Use MEDIAN instead of MEAN for robustness against outliers
-						self.initial_pitch = np.mean(self.head_pose_calibration_samples['pitch'])
-						self.initial_yaw = np.mean(self.head_pose_calibration_samples['yaw'])
-						self.initial_roll = np.mean(self.head_pose_calibration_samples['roll'])
+						# Use MEDIAN instead of MEAN for robustness against outliers (as described in the comment above)
+						self.initial_pitch = np.median(self.head_pose_calibration_samples['pitch'])
+						self.initial_yaw = np.median(self.head_pose_calibration_samples['yaw'])
+						self.initial_roll = np.median(self.head_pose_calibration_samples['roll'])
 						self.calibrated = True
 						if self.PRINT_DATA:
 							self.logger.info(
@@ -1079,13 +1437,17 @@ class Ocapi(object):
 				f"Head pose recalibrated by user: P={self.initial_pitch:.1f}, Y={self.initial_yaw:.1f}, R={self.initial_roll:.1f}")
 
 		# Adjust head pose angles based on the calibration baseline
+		pitch_shift = getattr(self, 'CALIBRATION_PITCH_SHIFT', 0.0)
+		yaw_shift = getattr(self, 'CALIBRATION_YAW_SHIFT', 0.0)
 		if self.calibrated:
-			self.adj_pitch = self.smooth_pitch - self.initial_pitch
-			self.adj_yaw = self.smooth_yaw - self.initial_yaw
+			self.adj_pitch = self.smooth_pitch - self.initial_pitch + pitch_shift
+			self.adj_yaw = self.smooth_yaw - self.initial_yaw + yaw_shift
 			self.adj_roll = self.smooth_roll - self.initial_roll
 		else:
-			# If not calibrated, use the raw smoothed values (no adjustment)
-			self.adj_pitch, self.adj_yaw, self.adj_roll = self.smooth_pitch, self.smooth_yaw, self.smooth_roll
+			# If not calibrated, use the raw smoothed values + shift
+			self.adj_pitch = self.smooth_pitch + pitch_shift
+			self.adj_yaw = self.smooth_yaw + yaw_shift
+			self.adj_roll = self.smooth_roll
 
 	def _perform_clustering_calibration(self):
 		"""Finds the baseline pose by clustering all collected samples. Returns the DBSCAN labels."""
@@ -1097,9 +1459,9 @@ class Ocapi(object):
 		if self.PRINT_DATA:
 			self.logger.info(f"Performing clustering calibration on {len(pose_array)} head pose samples...")
 
-		# DBSCAN parameters can be loaded from config
-		eps = getattr(self, "CLUSTERING_DBSCAN_EPS", 3.0)
-		min_samples = getattr(self, "CLUSTERING_DBSCAN_MIN_SAMPLES", 15)
+		# DBSCAN parameters can be loaded from config (checking both names to handle config schema naming flat mapping)
+		eps = getattr(self, "CLUSTERING_DBSCAN_EPS", getattr(self, "DBSCAN_EPS", 3.0))
+		min_samples = getattr(self, "CLUSTERING_DBSCAN_MIN_SAMPLES", getattr(self, "DBSCAN_MIN_SAMPLES", 15))
 
 		db = DBSCAN(eps=eps, min_samples=min_samples).fit(pose_array)
 		labels = db.labels_
@@ -1129,6 +1491,7 @@ class Ocapi(object):
 		return labels
 
 	def find_first_stimulus_onset(self):
+		self.in_stimulus_onset_search = True
 		"""
 		Performs a fast pass over the video to find the frame number and timestamp
 		of the first stimulus onset based on ROI brightness.
@@ -1227,6 +1590,7 @@ class Ocapi(object):
 			# Instead of tearing down, reset the video to the beginning and clear
 			# only the trial state, preserving the calibration and ROI results.
 			self.logger.info("First stimulus found. Resetting video to frame 0 for main analysis pass.")
+			self.in_stimulus_onset_search = False
 			self._reset_for_main_pass()
 
 	def _get_face_looks_text(self):
@@ -1328,28 +1692,7 @@ class Ocapi(object):
 				self.logger.info(
 					f"Trial {self.trial_counter} START @{start_t}ms (Part {self.current_video_part}). ROI Bright: {self.current_roi_brightness:.2f}")
 
-		# If a trial is currently active, check if it should end.
-		if self.current_trial_data and self.current_trial_data['active']:
-			if current_frame_time_ms >= self.current_trial_data['trial_end_time_ms']:
-				if self.PRINT_DATA:
-					self.logger.info(
-						f"Trial {self.current_trial_data['id']} END @{current_frame_time_ms}ms (Part {self.current_video_part}).")
 
-				# Finalize trial classification (looked vs. away)
-				if self.current_trial_data['stimulus_frames_processed_gaze'] > 0:
-					perc_on_stim = (self.current_trial_data['frames_on_stimulus_area'] /
-					                self.current_trial_data['stimulus_frames_processed_gaze']) * 100
-					# If the percentage is below the threshold, classify as 'away' (2).
-					# Otherwise, it remains the default 'looked' (1).
-					if perc_on_stim < self.LOOK_TO_STIMULUS_THRESHOLD_PERCENT:
-						self.current_trial_data['looked_final'] = 2
-
-				trial_id = self.current_trial_data['id']
-				self.last_trial_result_text = f"Trial {trial_id} Result: {'Looked (1)' if self.current_trial_data['looked_final'] == 1 else 'Away (2)'}"
-
-				self.all_trials_summary.append(self.current_trial_data.copy())
-				self.last_trial_end_time_ms = self.current_trial_data['trial_end_time_ms']
-				self.current_trial_data = None
 
 	def _end_active_trial_if_needed(self, current_frame_time_ms):
 		"""
@@ -1363,12 +1706,17 @@ class Ocapi(object):
 						f"Trial {self.current_trial_data['id']} END @{current_frame_time_ms}ms (Part {self.current_video_part}).")
 
 				# Finalize trial classification (looked vs. away)
-				if self.current_trial_data['stimulus_frames_processed_gaze'] > 0:
-					perc_on_stim = (self.current_trial_data['frames_on_stimulus_area'] /
-					                self.current_trial_data['stimulus_frames_processed_gaze']) * 100
-					# If the percentage is below the threshold, classify as 'away' (2).
-					# Otherwise, it remains the default 'looked' (1).
-					if perc_on_stim < self.LOOK_TO_STIMULUS_THRESHOLD_PERCENT:
+				if getattr(self, 'USE_FIRST_FRAME_ONLY_FOR_GAZE', False):
+					if self.current_trial_data['stimulus_frames_processed_gaze'] == 0:
+						self.current_trial_data['looked_final'] = 2
+				else:
+					if self.current_trial_data['stimulus_frames_processed_gaze'] > 0:
+						perc_on_stim = (self.current_trial_data['frames_on_stimulus_area'] /
+						                self.current_trial_data['stimulus_frames_processed_gaze']) * 100
+						if perc_on_stim < self.LOOK_TO_STIMULUS_THRESHOLD_PERCENT:
+							self.current_trial_data['looked_final'] = 2
+					else:
+						# If no valid landmarks were detected during the stimulus period, default to Away (2)
 						self.current_trial_data['looked_final'] = 2
 
 				trial_id = self.current_trial_data['id']
@@ -1427,8 +1775,10 @@ class Ocapi(object):
 		gaze_on_stim_area_this_frame = False
 		gaze_method = self.GAZE_CLASSIFICATION_METHOD
 
-		# --- Main classification logic ---
-		if gaze_method == "head_pose_only":
+		# If using eye gaze and eyes are not detected (e.g. blink/occlusion), classify as look-away
+		if gaze_method != "head_pose_only" and (self.l_cx == 0 or self.r_cx == 0):
+			pass
+		elif gaze_method == "head_pose_only":
 			if self.calibrated:
 				pitch_ok = self.STIMULUS_PITCH_RANGE[0] <= self.adj_pitch <= self.STIMULUS_PITCH_RANGE[1]
 				yaw_ok = self.STIMULUS_YAW_RANGE[0] <= self.adj_yaw <= self.STIMULUS_YAW_RANGE[1]
@@ -1439,8 +1789,9 @@ class Ocapi(object):
 			if self.calibrated:
 				# This method combines head yaw and eye dx sum.
 				# First, check the simple vertical constraints (pitch and eye dy)
-				pitch_ok = self.COMPENSATORY_HEAD_PITCH_RANGE[0] <= self.adj_pitch <= \
-				           self.COMPENSATORY_HEAD_PITCH_RANGE[1]
+				# Use subject-specific STIMULUS_PITCH_RANGE instead of default COMPENSATORY_HEAD_PITCH_RANGE
+				pitch_ok = self.STIMULUS_PITCH_RANGE[0] <= self.adj_pitch <= \
+				           self.STIMULUS_PITCH_RANGE[1]
 
 				left_dy_ok = self.STIMULUS_LEFT_IRIS_DY_RANGE[0] <= self.l_dy <= self.STIMULUS_LEFT_IRIS_DY_RANGE[1]
 				right_dy_ok = self.STIMULUS_RIGHT_IRIS_DY_RANGE[0] <= self.r_dy <= self.STIMULUS_RIGHT_IRIS_DY_RANGE[1]
@@ -1451,20 +1802,19 @@ class Ocapi(object):
 					eye_dx_sum = self.l_dx + self.r_dx
 
 					# Condition 1: Head is centered, eyes are centered
-					head_center_ok = self.COMPENSATORY_HEAD_YAW_RANGE_CENTER[0] <= head_yaw <= \
-					                 self.COMPENSATORY_HEAD_YAW_RANGE_CENTER[1]
+					# Use subject-specific STIMULUS_YAW_RANGE instead of default COMPENSATORY_HEAD_YAW_RANGE_CENTER
+					head_center_ok = self.STIMULUS_YAW_RANGE[0] <= head_yaw <= \
+					                 self.STIMULUS_YAW_RANGE[1]
 					eyes_center_ok = self.COMPENSATORY_EYE_SUM_RANGE_CENTER[0] <= eye_dx_sum <= \
 					                 self.COMPENSATORY_EYE_SUM_RANGE_CENTER[1]
 
-					# Condition 2: Head is turned left, eyes compensate to the right
-					head_left_ok = self.COMPENSATORY_HEAD_YAW_RANGE_LEFT[0] <= head_yaw <= \
-					               self.COMPENSATORY_HEAD_YAW_RANGE_LEFT[1]
+					# Condition 2: Head is turned left (negative yaw beyond center threshold)
+					head_left_ok = head_yaw < self.STIMULUS_YAW_RANGE[0]
 					eyes_right_comp_ok = self.COMPENSATORY_EYE_SUM_RANGE_LEFT_TURN[0] <= eye_dx_sum <= \
 					                     self.COMPENSATORY_EYE_SUM_RANGE_LEFT_TURN[1]
 
-					# Condition 3: Head is turned right, eyes compensate to the left
-					head_right_ok = self.COMPENSATORY_HEAD_YAW_RANGE_RIGHT[0] <= head_yaw <= \
-					                self.COMPENSATORY_HEAD_YAW_RANGE_RIGHT[1]
+					# Condition 3: Head is turned right (positive yaw beyond center threshold)
+					head_right_ok = head_yaw > self.STIMULUS_YAW_RANGE[1]
 					eyes_left_comp_ok = self.COMPENSATORY_EYE_SUM_RANGE_RIGHT_TURN[0] <= eye_dx_sum <= \
 					                    self.COMPENSATORY_EYE_SUM_RANGE_RIGHT_TURN[1]
 
@@ -1483,9 +1833,13 @@ class Ocapi(object):
 			# A.2: Horizontal check (dx)
 			dx_ok = False
 			if self.GAZE_DX_SUM_THRESHOLD < 999:  # Correctly checks if the sum method is enabled
-				# New, robust method: Check the sum of horizontal deviations
+				# New, robust method: Check the sum of horizontal deviations with head compensation
 				dx_sum = self.l_dx + self.r_dx
-				if abs(dx_sum) <= self.GAZE_DX_SUM_THRESHOLD:
+				beta = getattr(self, 'EYE_HEAD_COMPENSATION_BETA', 0.0)
+				# Compensated eye horizontal position = raw eye dx sum + beta * head_yaw
+				head_yaw = self.adj_yaw if self.calibrated else self.smooth_yaw
+				compensated_dx_sum = dx_sum + beta * head_yaw
+				if abs(compensated_dx_sum) <= self.GAZE_DX_SUM_THRESHOLD:
 					dx_ok = True
 			else:
 				# Fallback to original method: Check individual eye ranges
@@ -1517,6 +1871,9 @@ class Ocapi(object):
 		else:
 			self.gaze_on_stimulus_display_text = "GAZE OFF STIMULUS"
 
+		if getattr(self, 'USE_FIRST_FRAME_ONLY_FOR_GAZE', False) and self.current_trial_data['stimulus_frames_processed_gaze'] == 1:
+			self.current_trial_data['looked_final'] = 1 if gaze_on_stim_area_this_frame else 2
+
 	def _log_frame_data(self, current_frame_time_ms, frame_count, landmarks: Optional[FaceLandmarks], img_w, img_h):
 		current_log_timestamp = 0
 		if not self.starting_timestamp:  # This case might not be hit if starting_timestamp is always set in __init__
@@ -1530,7 +1887,11 @@ class Ocapi(object):
 			current_log_timestamp_dt = self.starting_timestamp + (frame_increment_for_log * frame_count)
 			current_log_timestamp = int(current_log_timestamp_dt.strftime(self.TIMESTAMP_FORMAT))
 
-		log_entry = [current_log_timestamp, frame_count,
+		trial_id = 0
+		if self.current_trial_data and self.current_trial_data.get('active'):
+			trial_id = self.current_trial_data.get('id', 0)
+
+		log_entry = [current_log_timestamp, frame_count, trial_id,
 		             self.l_cx, self.l_cy, self.r_cx, self.r_cy,
 		             self.l_dx, self.l_dy, self.r_dx, self.r_dy,
 		             self.TOTAL_BLINKS]  # TOTAL_BLINKS is per-part
@@ -1710,22 +2071,43 @@ class Ocapi(object):
 		cv.putText(frame, f'FPS: {self.FPS:.1f}', (tl_x, img_h - 10), font_face, font_scale_main, text_color_green,
 		           font_thickness)
 
-		if landmarks and landmarks.mp_multi_face_landmarks and landmarks.mp_multi_face_landmarks.multi_face_landmarks:
-			face_landmarks_mp = landmarks.mp_multi_face_landmarks.multi_face_landmarks[0]
-			if self.SHOW_ALL_FEATURES:
-				mp_drawing.draw_landmarks(image=frame, landmark_list=face_landmarks_mp,
-				                          connections=mp_face_mesh.FACEMESH_TESSELATION,
-				                          landmark_drawing_spec=drawing_spec,
-				                          connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style())
+		if landmarks:
+			if landmarks.mp_multi_face_landmarks and landmarks.mp_multi_face_landmarks.multi_face_landmarks:
+				face_landmarks_mp = landmarks.mp_multi_face_landmarks.multi_face_landmarks[0]
+				if self.SHOW_ALL_FEATURES:
+					mp_drawing.draw_landmarks(image=frame, landmark_list=face_landmarks_mp,
+					                          connections=mp_face_mesh.FACEMESH_TESSELATION,
+					                          landmark_drawing_spec=drawing_spec,
+					                          connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style())
+				else:
+					if self.l_cx != 0 or self.l_cy != 0:
+						cv.circle(frame, (self.l_cx, self.l_cy), 2, (0, 255, 0), -1, cv.LINE_AA)
+					if self.r_cx != 0 or self.r_cy != 0:
+						cv.circle(frame, (self.r_cx, self.r_cy), 2, (0, 255, 0), -1, cv.LINE_AA)
+					if self.ENABLE_HEAD_POSE and hasattr(self, '_indices_pose') and self.mesh_points is not None:
+						for idx in self._indices_pose:
+							if 0 <= idx < len(self.mesh_points): cv.circle(frame, self.mesh_points[idx], 2, (0, 0, 255), -1,
+							                                               cv.LINE_AA)
 			else:
+				# DeepLabCut or other landmarks drawing logic
 				if self.l_cx != 0 or self.l_cy != 0:
-					cv.circle(frame, (self.l_cx, self.l_cy), 2, (0, 255, 0), -1, cv.LINE_AA)
+					cv.circle(frame, (self.l_cx, self.l_cy), 3, (0, 255, 0), -1, cv.LINE_AA)
 				if self.r_cx != 0 or self.r_cy != 0:
-					cv.circle(frame, (self.r_cx, self.r_cy), 2, (0, 255, 0), -1, cv.LINE_AA)
-				if self.ENABLE_HEAD_POSE and hasattr(self, '_indices_pose') and self.mesh_points is not None:
-					for idx in self._indices_pose:
-						if 0 <= idx < len(self.mesh_points): cv.circle(frame, self.mesh_points[idx], 2, (0, 0, 255), -1,
-						                                               cv.LINE_AA)
+					cv.circle(frame, (self.r_cx, self.r_cy), 3, (0, 255, 0), -1, cv.LINE_AA)
+				if self.ENABLE_HEAD_POSE and self.mesh_points is not None:
+					mp_indices = {
+						'nose_tip': 4,
+						'chin': 152,
+						'left_eye_outer_corner': 263,
+						'right_eye_outer_corner': 33,
+						'left_mouth_corner': 291,
+						'right_mouth_corner': 61,
+					}
+					for key, idx in mp_indices.items():
+						if idx < len(self.mesh_points):
+							pt = self.mesh_points[idx]
+							if pt[0] != 0 or pt[1] != 0:
+								cv.circle(frame, tuple(pt.astype(int)), 3, (0, 0, 255), -1, cv.LINE_AA)
 
 	def _write_video_frame(self, frame):
 		if self.out and self.out.isOpened():
@@ -1790,6 +2172,169 @@ class Ocapi(object):
 
 		if self.PRINT_DATA: self.logger.info(f"State reset for Part {self.current_video_part}.")
 
+	def _apply_ml_classification(self):
+		try:
+			import pickle
+			import pandas as pd
+			import numpy as np
+			model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gaze_classifier_gb.pkl")
+			if not os.path.exists(model_path):
+				self.logger.warning(f"ML model path {model_path} not found. Falling back to heuristic.")
+				return
+				
+			with open(model_path, "rb") as f:
+				model_data = pickle.load(f)
+				clf = model_data["classifier"]
+				scaler = model_data["scaler"]
+				feature_indices = model_data.get("feature_indices", None)
+				threshold = model_data.get("threshold", 0.40)
+				latency_offset_ms = model_data.get("latency_offset_ms", 150)
+				
+			# Extract features from csv_data
+			cols = [
+				'timestamp_ms', 'frame_nr', 'trial_id', 'l_cx', 'l_cy', 'r_cx', 'r_cy',
+				'l_dx', 'l_dy', 'r_dx', 'r_dy', 'blinks', 'pitch', 'yaw', 'roll'
+			]
+			# Ensure we only take the first 15 columns (excluding optional raw landmarks)
+			cleaned_csv_data = [row[:15] for row in self.csv_data]
+			df = pd.DataFrame(cleaned_csv_data, columns=cols)
+			for c in cols:
+				df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
+				
+			# Compute derivative (velocity) features at frame level first
+			df['pitch_diff'] = df['pitch'].diff().fillna(0.0)
+			df['yaw_diff'] = df['yaw'].diff().fillna(0.0)
+			df['l_dx_diff'] = df['l_dx'].diff().fillna(0.0)
+			df['r_dx_diff'] = df['r_dx'].diff().fillna(0.0)
+			
+			# Vergence
+			df['vergence'] = df['l_dx'] - df['r_dx']
+			
+			feature_rows = []
+			for trial_sum in self.all_trials_summary:
+				tid = int(trial_sum['id'])
+				start_t = float(trial_sum['start_time_ms'])
+				window = df[df['trial_id'] == tid]
+				n_frames = len(window)
+				
+				if n_frames == 0:
+					feat = [0.0] * 54
+				else:
+					# Apply saccade latency offset
+					if latency_offset_ms > 0:
+						frame_times = window['frame_nr'] * (1000.0 / self.FPS)
+						window = window[(frame_times - start_t) >= latency_offset_ms]
+						
+					n_frames_after_offset = len(window)
+					if n_frames_after_offset == 0:
+						feat = [0.0] * 54
+					else:
+						has_face = ((window['l_cx'] != 0) | (window['r_cx'] != 0)).values.astype(bool)
+						n_face = has_face.sum()
+						face_frac = n_face / n_frames_after_offset
+						
+						w = window[has_face]
+					
+					def stats(arr):
+						if len(arr) == 0:
+							return [0.0, 0.0, 0.0, 0.0]
+						arr = np.array(arr, dtype=np.float32)
+						return [float(np.mean(arr)), float(np.std(arr)),
+								float(np.percentile(arr, 10)), float(np.percentile(arr, 90))]
+								
+					pitch_stats = stats(w['pitch'].values)
+					yaw_stats = stats(w['yaw'].values)
+					l_dx_stats = stats(w['l_dx'].values)
+					l_dy_stats = stats(w['l_dy'].values)
+					r_dx_stats = stats(w['r_dx'].values)
+					r_dy_stats = stats(w['r_dy'].values)
+					
+					# Velocity stats
+					pitch_diff_stats = stats(w['pitch_diff'].values)
+					yaw_diff_stats = stats(w['yaw_diff'].values)
+					l_dx_diff_stats = stats(w['l_dx_diff'].values)
+					r_dx_diff_stats = stats(w['r_dx_diff'].values)
+					
+					# Vergence stats
+					vergence_stats = stats(w['vergence'].values)
+					
+					if len(w) > 0:
+						eye_sum = (w['l_dx'] + w['r_dx']).values
+						eye_sum_stats = stats(eye_sum)
+						head_centered_frac = float(
+							((np.abs(w['pitch'].values) < 20) & (np.abs(w['yaw'].values) < 20)).mean()
+						)
+						eye_centered_frac = float((np.abs(eye_sum) < 5).mean())
+					else:
+						eye_sum_stats = [0.0] * 4
+						head_centered_frac = 0.0
+						eye_centered_frac = 0.0
+						
+					# Blink changes
+					if len(window) > 1:
+						blink_diff = np.diff(window['blinks'].values, prepend=window['blinks'].values[0])
+						blinks_frac = float(np.mean((blink_diff > 0) | (~has_face)))
+					else:
+						blinks_frac = 0.0
+						
+					feat = (
+						[n_face, face_frac, float(n_frames)]
+						+ pitch_stats
+						+ yaw_stats
+						+ l_dx_stats
+						+ l_dy_stats
+						+ r_dx_stats
+						+ r_dy_stats
+						+ eye_sum_stats
+						+ pitch_diff_stats
+						+ yaw_diff_stats
+						+ l_dx_diff_stats
+						+ r_dx_diff_stats
+						+ vergence_stats
+						+ [head_centered_frac, eye_centered_frac, blinks_frac]
+					)
+				feature_rows.append(feat)
+				
+			X = np.array(feature_rows, dtype=np.float32)
+			
+			# Handle NaNs
+			for col_i in range(X.shape[1]):
+				col_vals = X[:, col_i]
+				nan_mask = np.isnan(col_vals)
+				if nan_mask.all():
+					X[:, col_i] = 0.0
+				elif nan_mask.any():
+					X[nan_mask, col_i] = np.nanmean(col_vals)
+					
+			# Robust subject-wise normalization
+			for col in range(X.shape[1]):
+				col_vals = X[:, col]
+				median = np.median(col_vals)
+				q75, q25 = np.percentile(col_vals, [75, 25])
+				iqr = q75 - q25
+				X[:, col] = (col_vals - median) / iqr if iqr > 0 else col_vals - median
+					
+			# Slicing
+			if feature_indices is not None:
+				X = X[:, feature_indices]
+			else:
+				# Fallback default gaze_only_indices
+				gaze_only_indices = [1, 2] + list(range(11, 27)) + list(range(39, 47)) + [47, 48, 49, 50, 52]
+				X = X[:, gaze_only_indices]
+				
+			X_s = scaler.transform(X)
+			probs = clf.predict_proba(X_s)[:, 0]
+			predictions = np.where(probs >= threshold, 1, 2)
+			
+			for i, trial_sum in enumerate(self.all_trials_summary):
+				trial_sum['looked_final'] = int(predictions[i])
+				
+			self.logger.info(f"Successfully applied optimized ML classification to {len(self.all_trials_summary)} trials.")
+		except Exception as e:
+			self.logger.error(f"Error applying ML classification: {e}")
+			import traceback
+			self.logger.error(traceback.format_exc())
+
 	def _save_trial_summary(self, part_suffix=""):
 		if not (self.ENABLE_VIDEO_TRIAL_DETECTION and self.all_trials_summary):
 			if self.ENABLE_VIDEO_TRIAL_DETECTION and self.PRINT_DATA: self.logger.info(
@@ -1799,15 +2344,20 @@ class Ocapi(object):
 		if self.current_trial_data and self.current_trial_data['active']:
 			if self.PRINT_DATA: self.logger.info(
 				f"Finalizing active trial {self.current_trial_data['id']} on exit/split (Part {self.current_video_part}).")
-			if self.current_trial_data['stimulus_frames_processed_gaze'] > 0:
-				perc_on_stim = (self.current_trial_data['frames_on_stimulus_area'] /
-				                self.current_trial_data['stimulus_frames_processed_gaze']) * 100
-				# If the percentage is below the threshold, classify as 'away' (2).
-				# Otherwise, it remains the default 'looked' (1).
-				if perc_on_stim < self.LOOK_TO_STIMULUS_THRESHOLD_PERCENT:
+			if getattr(self, 'USE_FIRST_FRAME_ONLY_FOR_GAZE', False):
+				if self.current_trial_data['stimulus_frames_processed_gaze'] == 0:
 					self.current_trial_data['looked_final'] = 2
+			else:
+				if self.current_trial_data['stimulus_frames_processed_gaze'] > 0:
+					perc_on_stim = (self.current_trial_data['frames_on_stimulus_area'] /
+					                self.current_trial_data['stimulus_frames_processed_gaze']) * 100
+					if perc_on_stim < self.LOOK_TO_STIMULUS_THRESHOLD_PERCENT:
+						self.current_trial_data['looked_final'] = 2
 			self.all_trials_summary.append(self.current_trial_data.copy())
 			self.current_trial_data = None  # Clear after adding
+
+		if getattr(self, 'use_ml_classifier', False):
+			self._apply_ml_classification()
 
 		ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
 		folder = self.TRACKING_DATA_LOG_FOLDER or "."
@@ -1925,42 +2475,105 @@ class Ocapi(object):
 		First pass over the video to collect head pose data and perform clustering calibration.
 		Returns True on success, False on failure.
 		"""
-		if not self.cap or not self.cap.isOpened():
-			self.logger.error("Video capture not open for calibration pass.")
-			return False
+		self.in_calibration_pass = True
+		try:
+			if not self.cap or not self.cap.isOpened():
+				self.logger.error("Video capture not open for calibration pass.")
+				return False
 
-		calib_duration_sec = getattr(self, "CLUSTERING_CALIB_DURATION_SECONDS", 30)
-		frame_limit = int(calib_duration_sec * self.FPS)
+			calib_duration_sec = getattr(self, "CLUSTERING_CALIB_DURATION_SECONDS", 30)
+			frame_limit = int(calib_duration_sec * self.FPS)
 
-		frame_num = 0
-		while self.cap.isOpened() and frame_num < frame_limit:			
-			frame, img_h, img_w, ret = self._get_and_preprocess_frame()
-			if not ret:
-				if self.PRINT_DATA: self.logger.info("Video ended before calibration period finished.")
-				break
+			# Lists to store eye calibration values
+			eye_calib_l_dx = []
+			eye_calib_r_dx = []
+			eye_calib_l_dy = []
+			eye_calib_r_dy = []
 
-			# We only need to run face mesh and head pose estimation
-			landmarks = self.detector.detect(frame)
+			frame_num = 0
+			while self.cap.isOpened() and frame_num < frame_limit:			
+				frame, img_h, img_w, ret = self._get_and_preprocess_frame()
+				if not ret:
+					if self.PRINT_DATA: self.logger.info("Video ended before calibration period finished.")
+					break
 
-			if landmarks:
-				# _process_head_pose will see that clustering is pending and append samples
-				self._process_head_pose(landmarks, img_h, img_w, key_pressed=-1)
+				self.frame_count = frame_num
+				landmarks = self.detector.detect(frame)
 
-			frame_num += 1
-			if self.PRINT_DATA and frame_num % int(self.FPS or 30) == 0:
-				self.logger.info(f"  Calibration Pass: Processed {frame_num}/{frame_limit} frames...")
+				if landmarks:
+					# _process_head_pose will see that clustering is pending and append samples
+					self._process_head_pose(landmarks, img_h, img_w, key_pressed=-1)
+					
+					# Extract raw eye features (temporarily bypassing any baseline adjustment)
+					try:
+						l_cx_f, l_cy_f = landmarks.left_iris_center
+						r_cx_f, r_cy_f = landmarks.right_iris_center
+						center_left = np.array([l_cx_f, l_cy_f], dtype=np.float32)
+						center_right = np.array([r_cx_f, r_cy_f], dtype=np.float32)
+						outer_left_corner = landmarks.left_eye_outer_corner
+						outer_right_corner = landmarks.right_eye_outer_corner
+						
+						l_dx_raw, l_dy_raw = self.vector_position(outer_left_corner, center_left)
+						r_dx_raw, r_dy_raw = self.vector_position(outer_right_corner, center_right)
+						
+						eye_calib_l_dx.append(l_dx_raw)
+						eye_calib_r_dx.append(r_dx_raw)
+						eye_calib_l_dy.append(l_dy_raw)
+						eye_calib_r_dy.append(r_dy_raw)
+					except:
+						pass
 
-		# If the video was shorter than the calibration period, we might need to trigger calibration manually
-		if not self.calibrated and len(self.clustering_calib_all_samples) > 0:
-			self._perform_clustering_calibration()
+				frame_num += 1
+				if self.PRINT_DATA and frame_num % int(self.FPS or 30) == 0:
+					self.logger.info(f"  Calibration Pass: Processed {frame_num}/{frame_limit} frames...")
 
-		# Release the capture object; it will be re-initialized for the main pass
-		self.cap.release()
+			# If the video was shorter than the calibration period, we might need to trigger calibration manually
+			if not self.calibrated and len(self.clustering_calib_all_samples) > 0:
+				self._perform_clustering_calibration()
 
-		# After calibration, we are no longer pending auto-calibration
-		self.auto_calibrate_pending = False
+			# Store eye calibration baselines (using median of calibration pass frames)
+			if eye_calib_l_dx:
+				self.eye_l_dx_baseline = np.median(eye_calib_l_dx)
+				self.eye_r_dx_baseline = np.median(eye_calib_r_dx)
+				self.eye_l_dy_baseline = np.median(eye_calib_l_dy)
+				self.eye_r_dy_baseline = np.median(eye_calib_r_dy)
+				if self.PRINT_DATA:
+					self.logger.info(f"Eye calibration baselines: L_DX={self.eye_l_dx_baseline:.2f}, R_DX={self.eye_r_dx_baseline:.2f}, L_DY={self.eye_l_dy_baseline:.2f}, R_DY={self.eye_r_dy_baseline:.2f}")
+			else:
+				self.eye_l_dx_baseline = 0.0
+				self.eye_r_dx_baseline = 0.0
+				self.eye_l_dy_baseline = 0.0
+				self.eye_r_dy_baseline = 0.0
 
-		return self.calibrated
+			# Subject-Adaptive Gaze Classification (Recommendation 3)
+			if len(self.clustering_calib_all_samples) > 0:
+				pose_array = np.array(self.clustering_calib_all_samples)
+				yaw_std = np.std(pose_array[:, 1])
+				self.logger.info(f"Subject-Adaptive Check: Head Yaw Standard Deviation is {yaw_std:.2f} degrees.")
+				
+				if getattr(self, "GAZE_CLASSIFICATION_METHOD", "") == "ml_classifier":
+					self.use_ml_classifier = True
+					self.logger.info("  -> Gaze classification method is set to ml_classifier. Forcing ML classification.")
+				elif yaw_std >= 10.0:
+					self.EYE_HEAD_COMPENSATION_BETA = 0.3
+					self.LOOK_TO_STIMULUS_THRESHOLD_PERCENT = 35
+					self.use_ml_classifier = False
+					self.logger.info("  -> High head motion detected. Enabling head compensation: BETA = 0.3, LOOK THRESHOLD = 35%.")
+				else:
+					self.EYE_HEAD_COMPENSATION_BETA = 0.0
+					self.LOOK_TO_STIMULUS_THRESHOLD_PERCENT = 20
+					self.use_ml_classifier = True
+					self.logger.info("  -> Low/Moderate head motion detected. Enabling quiet ML model: BETA = 0.0, LOOK THRESHOLD = 20%.")
+
+			# Release the capture object; it will be re-initialized for the main pass
+			self.cap.release()
+
+			# After calibration, we are no longer pending auto-calibration
+			self.auto_calibrate_pending = False
+
+			return self.calibrated
+		finally:
+			self.in_calibration_pass = False
 
 	def _cleanup(self, finalize_data=True):
 		"""Releases resources and finalizes data saving."""
@@ -1994,7 +2607,7 @@ class Ocapi(object):
 			self.logger.info("--- Tracker is already primed. Skipping setup passes and starting main analysis. ---")
 		else:
 			# --- Standard Setup Execution Path for a fresh instance ---
-			if getattr(self, 'STIMULUS_ROI_METHOD', 'static') == 'dynamic':
+			if getattr(self, 'STIMULUS_ROI_METHOD', 'static') == 'dynamic' and not getattr(self, 'skip_video_decoding', False):
 				self.logger.info("--- Starting Pass 1: Dynamic ROI Detection ---")
 				if not self._find_dynamic_roi():
 					self.logger.error("Dynamic ROI detection failed. Aborting analysis.")
@@ -2026,8 +2639,9 @@ class Ocapi(object):
 
 				# --- NEW: Frame Skipping Logic ---
 				if self.frame_count > 0 and self.FRAME_SKIP > 1 and (self.frame_count % self.FRAME_SKIP) != 0:
-					ret = self.cap.grab() # Efficiently skip frame without decoding
-					if not ret: break
+					if self.requires_frame_pixels:
+						ret = self.cap.grab() # Efficiently skip frame without decoding
+						if not ret: break
 					continue # Go to the next iteration of the loop
 
 				frame, img_h, img_w, ret = self._get_and_preprocess_frame()
@@ -2049,7 +2663,10 @@ class Ocapi(object):
 					self.split_triggered_and_finalized = True
 				# --- End Splitting Logic ---
 
-				key_pressed = cv.waitKey(1) & 0xFF
+				if self.SHOW_ON_SCREEN_DATA:
+					key_pressed = cv.waitKey(1) & 0xFF
+				else:
+					key_pressed = -1
 
 				landmarks = self.detector.detect(frame)
 				self.mesh_points = landmarks.raw_mesh_points_2d if landmarks else None
